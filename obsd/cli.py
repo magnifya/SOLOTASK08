@@ -9,7 +9,7 @@ import sys
 
 from .alerts import AlertEngine
 from .http_app import run_server
-from .tsdb import ObsError, SeriesStore
+from .tsdb import ObsError, SeriesStore, parse_matchers_text
 
 DEFAULT_DATA_DIR = "./obsd_data"
 AGGS = ["sum", "avg", "min", "max", "count"]
@@ -85,6 +85,9 @@ def _build_parser():
     query.add_argument("--group-by", default=None, metavar="JSON_ARRAY",
                        help="JSON array of label keys for cross-series grouping "
                             "(requires --agg; [] merges all matching series)")
+    query.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                       help='JSON array of {"key","op","value"} matchers; '
+                            'op is one of =, !=, =~, !~ (AND with --label)')
 
     rule = _common(sub.add_parser("rule-add", help="add an alert rule"))
     rule.add_argument("--id", default=None)
@@ -140,9 +143,11 @@ def _run(args, store, engine):
                 group_by = json.loads(args.group_by)
             except ValueError:
                 raise ObsError("--group-by must be a JSON array of label keys")
+        matchers = parse_matchers_text(args.matchers, "--matchers")
         rows = store.query(args.tenant, args.metric, labels=_labels(args.label),
                            start_ms=args.start, end_ms=args.end, step_ms=args.step,
-                           agg=args.agg, group_by=group_by, window_ms=args.window_ms)
+                           agg=args.agg, group_by=group_by, window_ms=args.window_ms,
+                           matchers=matchers)
         _emit({"series": [{"labels": row["labels"], "points": row["points"]} for row in rows]})
     elif args.command == "rule-add":
         _emit(engine.add_rule({

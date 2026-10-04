@@ -39,6 +39,7 @@ stderr and exits non-zero.
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
+| `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
@@ -56,7 +57,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=` (group_by is a JSON array of label keys) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -125,6 +126,28 @@ raw samples are returned in `[timestamp, value]` order. `rollup(tenant, metric,
 labels, window_ms, agg)` is `query` with `step_ms = window_ms` over the whole
 stored range, with empty buckets dropped; output is ordered by `series_id`, so
 it is deterministic.
+
+**Label matchers.** In addition to exact `labels` / `label.k=v` filtering,
+`query` accepts `matchers` (`matchers` on `GET /v1/query`, `--matchers` on the
+CLI): a JSON array of objects containing exactly `key` (non-empty string),
+`op` and `value` (string, may be empty). Ops are `=` / `!=` (exact whole-string
+equality and negation) and `=~` / `!~` (Python `re` syntax matched against the
+*whole* label value via full match, case-sensitive and Unicode-aware, and its
+negation). Omitting the parameter, passing Python `None`, or sending `[]` adds
+no condition; an explicit JSON `null` or empty text is rejected (HTTP/CLI).
+Matchers combine with each other and with the exact label filters by logical
+AND — including several matchers on the same key — apply to raw series labels
+before bucketing or grouping (labels absent from `group_by` count too), and are
+restricted to the requested `tenant` and `metric`; `tenant`, `metric` and
+`series_id` are not implicit labels. A missing key never satisfies `=`/`=~` but
+always satisfies `!=`/`!~`, so `=~ ""` selects only series where the key exists
+with an empty value (grouping still separates a missing key from an empty
+value). `api-.*` matches `api-a` but not `xapi-a`. Duplicate matchers never
+duplicate series, matcher order is irrelevant, and contradictory matchers
+yield an empty result. Invalid JSON, a non-array, non-object elements, missing
+or extra fields, wrong types, an empty `key`, an unsupported `op` or an invalid
+regex raise `ObsError` (`400` over HTTP, one JSON error line on stderr for the
+CLI); every matcher is validated even when no candidate series exists.
 
 **Grouped query.** `query(..., agg=agg, group_by=[keys...])` aggregates *across*
 series: matching series (same tenant/metric/label filters and `[start_ms,

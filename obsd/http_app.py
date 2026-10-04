@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .alerts import AlertEngine
-from .tsdb import ObsError, SeriesStore
+from .tsdb import ObsError, SeriesStore, parse_matchers_text
 
 __all__ = ["ObsdHTTPServer", "create_server", "make_handler", "run_server"]
 
@@ -71,7 +71,8 @@ def dispatch(store, engine, method, path, params, payload):
                            step_ms=_int(params.get("step"), "step"),
                            agg=params.get("agg") or None,
                            group_by=_group_by(params.get("group_by")),
-                           window_ms=_int(params.get("window"), "window"))
+                           window_ms=_int(params.get("window"), "window"),
+                           matchers=parse_matchers_text(params.get("matchers")))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
     if (method, path) == ("POST", "/v1/rules"):
@@ -140,6 +141,11 @@ def make_handler(store, engine):
         def _handle(self, method, call):
             parsed = urlparse(self.path)
             params = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+            # Blank values are dropped like every other parameter, except an
+            # explicit empty matchers is an illegal value rather than omission.
+            blank_params = parse_qs(parsed.query, keep_blank_values=True)
+            if "matchers" in blank_params:
+                params["matchers"] = blank_params["matchers"][-1]
             try:
                 payload = self._read_json() if method == "POST" else {}
                 status, body = call(parsed.path, params, payload)

@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 
 __all__ = ["ObsError", "SeriesStore", "AGGREGATES", "canonical_identity", "series_id_for"]
 
 AGGREGATES = ("sum", "avg", "min", "max", "count")
+MATCHER_OPS = ("=", "!=", "=~", "!~")
 
 
 class ObsError(Exception):
@@ -76,6 +78,89 @@ def matches_labels(series_labels, matcher):
     if isinstance(matcher, (list, tuple)):
         matcher = as_labels(matcher)
     return all(str(series_labels.get(key)) == str(value) for key, value in matcher.items())
+
+
+def compile_matchers(matchers):
+    """Validate ``matchers`` and return ``(key, op, value, pattern)`` tuples.
+
+    Each element is an object with exactly ``key`` (non-empty string), ``op``
+    (one of ``=``, ``!=``, ``=~``, ``!~``) and ``value`` (string, possibly
+    empty). ``None`` and an empty list add no condition; regex patterns are
+    compiled here, so an invalid pattern is rejected before any series is read.
+    """
+    if matchers is None:
+        return ()
+    if not isinstance(matchers, (list, tuple)):
+        raise ObsError("matchers must be a list of matcher objects")
+    compiled = []
+    for element in matchers:
+        if not isinstance(element, dict):
+            raise ObsError("each matcher must be an object with key, op and value")
+        if set(element) != {"key", "op", "value"}:
+            raise ObsError("each matcher must contain exactly key, op and value")
+        key, op, value = element["key"], element["op"], element["value"]
+        if not isinstance(key, str) or not key:
+            raise ObsError("matcher key must be a non-empty string")
+        if op not in MATCHER_OPS:
+            raise ObsError("matcher op must be one of %s" % (MATCHER_OPS,))
+        if not isinstance(value, str):
+            raise ObsError("matcher value must be a string")
+        pattern = None
+        if op in ("=~", "!~"):
+            try:
+                pattern = re.compile(value)
+            except re.error as exc:
+                raise ObsError("invalid matcher regex %r: %s" % (value, exc))
+        compiled.append((key, op, value, pattern))
+    return tuple(compiled)
+
+
+def matchers_hold(series_labels, compiled):
+    """True when every compiled matcher holds for ``series_labels``.
+
+    A missing key never satisfies ``=``/``=~`` but always satisfies ``!=``/
+    ``!~``; regex matchers anchor with ``fullmatch`` so the pattern covers the
+    whole value. Only real labels are considered.
+    """
+    for key, op, value, pattern in compiled:
+        present = key in series_labels
+        if op == "=":
+            if not present or series_labels[key] != value:
+                return False
+        elif op == "!=":
+            if present and series_labels[key] == value:
+                return False
+        elif op == "=~":
+            if not present or pattern.fullmatch(series_labels[key]) is None:
+                return False
+        else:  # "!~"
+            if present and pattern.fullmatch(series_labels[key]) is not None:
+                return False
+    return True
+
+
+def parse_matchers_text(text, field="matchers"):
+    """Decode a JSON array text of matcher objects; ``None``/absent adds none.
+
+    Used by the HTTP and CLI entry points, where the parameter arrives as a
+    string. Returns the raw decoded list (validated later by
+    :func:`compile_matchers`, which runs even with no candidate series). Empty
+    text and an explicit JSON ``null`` are illegal here (unlike omitting the
+    parameter or passing Python ``None`` to ``query``).
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str) or not text:
+        raise ObsError("%s must be a JSON array of matcher objects" % field)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ObsError("%s must be a JSON array of matcher objects" % field)
+    if data is None:
+        raise ObsError("%s must be a JSON array of matcher objects" % field)
+    if not isinstance(data, list):
+        raise ObsError("%s must be a JSON array of matcher objects" % field)
+    return data
 
 
 def _aggregate(values, agg):
@@ -353,22 +438,25 @@ class SeriesStore:
         return {"series_id": sid, "written": written, "duplicates": duplicates}
 
     # ------------------------------------------------------------------- query
-    def _matching_series(self, tenant, metric, labels):
+    def _matching_series(self, tenant, metric, labels, compiled_matchers=()):
         """Snapshot of every matching series: sid, labels and raw samples.
 
         Copied under one lock acquisition so a query can never mix samples from
-        before and after a concurrent write or retention sweep.
+        before and after a concurrent write or retention sweep. Exact ``labels``
+        and the compiled ``matchers`` both filter the same raw series labels
+        before any aggregation or grouping takes place.
         """
         with self._lock:
             ids = sorted(sid for sid, row in self._series.items()
                          if row["tenant"] == tenant and row["metric"] == metric
-                         and matches_labels(dict(row["labels"]), labels))
+                         and matches_labels(dict(row["labels"]), labels)
+                         and matchers_hold(dict(row["labels"]), compiled_matchers))
             return [(sid, dict(self._series[sid]["labels"]), list(self._samples[sid]))
                     for sid in ids]
 
-    def _samples_for(self, tenant, metric, labels):
+    def _samples_for(self, tenant, metric, labels, compiled_matchers=()):
         return [(sid, samples) for sid, _, samples in
-                self._matching_series(tenant, metric, labels)]
+                self._matching_series(tenant, metric, labels, compiled_matchers)]
 
     def _scan(self, tenant, metric, labels, start_ms, end_ms):
         """Raw samples of matching series inside ``[start, end]`` (internal).
@@ -387,8 +475,17 @@ class SeriesStore:
         return out
 
     def query(self, tenant, metric, labels=None, start_ms=None, end_ms=None,
-              step_ms=None, agg=None, group_by=None, window_ms=None):
+              step_ms=None, agg=None, group_by=None, window_ms=None, matchers=None):
         """Raw, bucketed or sliding-window points per matching series.
+
+        ``matchers`` is an optional list of ``{"key", "op", "value"}`` objects
+        (``None`` or ``[]`` adds no condition). Supported ops: ``=``, ``!=``
+        (exact whole-string equality/negation), ``=~``, ``!~`` (Python ``re``
+        full-match/negation, case-sensitive, Unicode-aware). Matchers combine
+        with each other and with ``labels`` by logical AND, apply to the raw
+        series labels before bucketing/grouping (keys absent from
+        ``group_by`` included), and are validated up front even when no series
+        could match. A missing key fails ``=``/``=~`` and passes ``!=``/``!~``.
 
         ``step_ms`` buckets are left-closed/right-open on epoch multiples and
         empty buckets are emitted as ``None``. A series with no sample in range
@@ -413,13 +510,17 @@ class SeriesStore:
         series (or group) gets the full time grid even when every window is
         empty; no matching series yields an empty list.
         """
+        # Compile before anything else so all matchers are validated even when
+        # another argument (or the absence of candidate series) would yield an
+        # empty result.
+        compiled_matchers = compile_matchers(matchers)
         if agg is not None and agg not in AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
         if window_ms is not None:
             lo, hi, step, window = self._window_params(
                 start_ms, end_ms, step_ms, window_ms, agg)
             return self._query_windows(tenant, metric, labels, lo, hi, step,
-                                       agg, group_by, window)
+                                       agg, group_by, window, compiled_matchers)
         if step_ms is not None and (not _num(step_ms) or int(step_ms) <= 0):
             raise ObsError("step_ms must be a positive number")
         lo = None if start_ms is None else int(start_ms)
@@ -428,9 +529,10 @@ class SeriesStore:
             raise ObsError("end_ms must be >= start_ms")
         if group_by is not None:
             return self._query_grouped(tenant, metric, labels, lo, hi,
-                                       step_ms, agg, group_by)
+                                       step_ms, agg, group_by, compiled_matchers)
         out = []
-        for sid, samples in self._samples_for(tenant, metric, labels):
+        for sid, samples in self._samples_for(tenant, metric, labels,
+                                              compiled_matchers):
             rows = [item for item in samples
                     if (lo is None or item[0] >= lo) and (hi is None or item[0] <= hi)]
             points = self._bucket(rows, step_ms, agg, lo, hi)
@@ -485,7 +587,7 @@ class SeriesStore:
         return points
 
     def _query_windows(self, tenant, metric, labels, lo, hi, step_ms, agg,
-                       group_by, window):
+                       group_by, window, compiled_matchers=()):
         if group_by is not None:
             if not isinstance(group_by, (list, tuple)):
                 raise ObsError("group_by must be a list of label keys")
@@ -496,7 +598,7 @@ class SeriesStore:
             if len(set(keys)) != len(keys):
                 raise ObsError("group_by entries must not contain duplicates")
         times = list(self._window_grid(lo, hi, step_ms))
-        matched = self._matching_series(tenant, metric, labels)
+        matched = self._matching_series(tenant, metric, labels, compiled_matchers)
         if group_by is None:
             out = []
             for sid, series_labels, samples in matched:
@@ -539,7 +641,8 @@ class SeriesStore:
         return [[key, _aggregate(groups[key], agg) if key in groups else None]
                 for key in range(start, end + 1, step)]
 
-    def _query_grouped(self, tenant, metric, labels, lo, hi, step_ms, agg, group_by):
+    def _query_grouped(self, tenant, metric, labels, lo, hi, step_ms, agg, group_by,
+                       compiled_matchers=()):
         """Cross-series aggregation: one row per distinct ``group_by`` tuple.
 
         The raw in-range samples of every series in a group are pooled before
@@ -559,7 +662,8 @@ class SeriesStore:
         if agg is None:
             raise ObsError("group_by requires agg")
         groups = {}
-        for sid, samples in self._samples_for(tenant, metric, labels):
+        for sid, samples in self._samples_for(tenant, metric, labels,
+                                              compiled_matchers):
             series_labels = dict(self._series[sid]["labels"])
             group_labels = {key: series_labels[key] for key in keys
                             if key in series_labels}
