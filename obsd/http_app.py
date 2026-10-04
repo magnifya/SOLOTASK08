@@ -42,6 +42,24 @@ def _group_by(value):
         return json.loads(value)
     except ValueError:
         raise ObsError("group_by must be a JSON array of label keys")
+def _matchers(value):
+    """``matchers`` arrives as a JSON array text of {key, op, value} objects.
+
+    Absent means no extra condition; blank text, an explicit JSON null or any
+    non-array JSON value are rejected here; the store then validates every
+    element (including its regex) before series are consulted.
+    """
+    if value is None:
+        return None
+    if value == "":
+        raise ObsError("matchers must be a JSON array of {key, op, value} objects")
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        raise ObsError("matchers must be a JSON array of {key, op, value} objects")
+    if not isinstance(parsed, list):
+        raise ObsError("matchers must be a JSON array of {key, op, value} objects")
+    return parsed
 def dispatch(store, engine, method, path, params, payload):
     """Pure routing: (status, body) or ObsError. No sockets involved."""
     labels = {key[6:]: value for key, value in params.items() if key.startswith("label.")}
@@ -71,7 +89,8 @@ def dispatch(store, engine, method, path, params, payload):
                            step_ms=_int(params.get("step"), "step"),
                            agg=params.get("agg") or None,
                            group_by=_group_by(params.get("group_by")),
-                           window_ms=_int(params.get("window"), "window"))
+                           window_ms=_int(params.get("window"), "window"),
+                           matchers=_matchers(params.get("matchers")))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
     if (method, path) == ("POST", "/v1/rules"):
@@ -140,6 +159,13 @@ def make_handler(store, engine):
         def _handle(self, method, call):
             parsed = urlparse(self.path)
             params = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+            # parse_qs drops blank values, but an explicit blank matchers text is
+            # an illegal value rather than an omitted parameter; surface just
+            # that case so _matchers can reject it while every other parameter
+            # keeps its legacy blank-value behaviour.
+            blank = parse_qs(parsed.query, keep_blank_values=True).get("matchers")
+            if "matchers" not in params and blank and blank[-1] == "":
+                params["matchers"] = ""
             try:
                 payload = self._read_json() if method == "POST" else {}
                 status, body = call(parsed.path, params, payload)

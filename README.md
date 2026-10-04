@@ -39,6 +39,7 @@ stderr and exits non-zero.
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
+| `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"},{"key":"canary","op":"!=","value":"true"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
@@ -56,7 +57,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=` (group_by is a JSON array of label keys) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers is `[{"key","op","value"}]` with `op` in `=`,`!=`,`=~`,`!~`) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -142,6 +143,40 @@ range is still listed with empty `points`; no matching series at all yields an
 empty `series` array. `group_by` must be a list of distinct non-empty strings
 and requires `agg`; violations raise `ObsError` (`400` over HTTP, one JSON
 error line on stderr for the CLI).
+
+**Composable label matchers.** `query(..., matchers=[...])` adds optional
+negation and regular-expression label filters; the HTTP parameter and the CLI
+`--matchers` flag both take the same value as a JSON array text. Each element
+is exactly `{"key": <non-empty string>, "op": <one of `=` `!=` `=~` `!~`>,
+"value": <string, possibly empty>}` — extra or missing fields, wrong types, an
+empty key, an unsupported operator or an invalid Python `re` pattern are all
+rejected (`ObsError`, HTTP `400`, one JSON error line on stderr with non-zero
+exit), and blank text or an explicit `null` for the HTTP/CLI parameter is
+illegal. Omitting the parameter, passing `[]` or passing Python `None` adds no
+condition. Every matcher is validated (and every regex compiled) before series
+are consulted, so the errors above are reported even with no candidate series
+or when other conditions already exclude everything.
+
+The matchers combine with the exact `labels`/`label.k`/`--label` filter by
+logical AND, and multiple matchers on the same key also all hold (logical AND);
+duplicate matchers never return a series twice, ordering never changes the
+result, and contradictory matchers simply yield no rows. `=` compares the whole
+label string and `!=` is its negation; `=~` matches the whole label value with
+Python `re` syntax (`re.fullmatch`, case sensitive, Unicode aware by default)
+and `!~` is its negation. So `api-.*` matches `api-a` but not `xapi-a`, and an
+empty regex matches only a key that is present with the empty-string value. A
+missing key fails `=` and `=~` but satisfies `!=` and `!~`; a present empty
+value compares as `""`, while grouping still keeps a missing key and an
+empty-string value in different groups. Matchers see only the real series
+labels — `tenant`, `metric` and `series_id` are never implicit label keys — and
+filtering is scoped to the requested tenant and metric, acting on the raw
+series labels (including keys absent from `group_by`) before any bucketing,
+grouping or windowing. The semantics are identical for raw, fixed-bucket,
+grouped and sliding-window queries, which keep their output shape, time bounds,
+aggregation formulas, empty-result rules and ordering. Like every query, a
+matchers query reads one coherent snapshot (concurrent writes and retention
+sweeps cannot mix versions), never changes data, quotas, counters or alert
+state, and reproduces the same history after a reopen.
 
 **Sliding-window query.** `query(..., start_ms=start, end_ms=end, step_ms=step,
 agg=agg, window_ms=window)` switches to a separate mode the moment `window_ms`
@@ -321,7 +356,11 @@ buckets, null buckets, all five aggregations, deterministic rollups,
 sliding-window grids with left-open/right-closed windows, null empty windows
 (including count), full grids for empty series and groups, window argument
 validation across Python/HTTP/CLI, window snapshot consistency under
-concurrent writes and retention, retention,
+concurrent writes and retention, composable label matchers (=, !=, =~, !~:
+whole-string and full-value regex matching, missing-key and empty-value
+behaviour, AND combination with exact labels, identical semantics across raw,
+bucketed, grouped and sliding-window queries, shape/type/regex validation
+across Python/HTTP/CLI including with no candidate series), retention,
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label

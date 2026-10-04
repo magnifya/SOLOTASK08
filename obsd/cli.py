@@ -85,6 +85,10 @@ def _build_parser():
     query.add_argument("--group-by", default=None, metavar="JSON_ARRAY",
                        help="JSON array of label keys for cross-series grouping "
                             "(requires --agg; [] merges all matching series)")
+    query.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                       help='JSON array of {"key","op","value"} label matchers; '
+                            "op is one of =, !=, =~, !~ and combines with --label "
+                            "by logical AND (omit to add no condition)")
 
     rule = _common(sub.add_parser("rule-add", help="add an alert rule"))
     rule.add_argument("--id", default=None)
@@ -140,9 +144,25 @@ def _run(args, store, engine):
                 group_by = json.loads(args.group_by)
             except ValueError:
                 raise ObsError("--group-by must be a JSON array of label keys")
+        matchers = None
+        if args.matchers is not None:
+            # Blank text, explicit null and non-array JSON are rejected; the
+            # store validates each element (and compiles every regex) itself.
+            if args.matchers == "":
+                raise ObsError(
+                    "--matchers must be a JSON array of {key, op, value} objects")
+            try:
+                matchers = json.loads(args.matchers)
+            except ValueError:
+                raise ObsError(
+                    "--matchers must be a JSON array of {key, op, value} objects")
+            if not isinstance(matchers, list):
+                raise ObsError(
+                    "--matchers must be a JSON array of {key, op, value} objects")
         rows = store.query(args.tenant, args.metric, labels=_labels(args.label),
                            start_ms=args.start, end_ms=args.end, step_ms=args.step,
-                           agg=args.agg, group_by=group_by, window_ms=args.window_ms)
+                           agg=args.agg, group_by=group_by, window_ms=args.window_ms,
+                           matchers=matchers)
         _emit({"series": [{"labels": row["labels"], "points": row["points"]} for row in rows]})
     elif args.command == "rule-add":
         _emit(engine.add_rule({
