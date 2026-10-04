@@ -70,7 +70,8 @@ def dispatch(store, engine, method, path, params, payload):
                            end_ms=_int(params.get("end"), "end"),
                            step_ms=_int(params.get("step"), "step"),
                            agg=params.get("agg") or None,
-                           group_by=_group_by(params.get("group_by")))
+                           group_by=_group_by(params.get("group_by")),
+                           window_ms=_int(params.get("window"), "window"))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
     if (method, path) == ("POST", "/v1/rules"):

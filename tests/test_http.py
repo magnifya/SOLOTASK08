@@ -131,6 +131,43 @@ class TestHttpApi(HttpCase):
             "GET", "/v1/query?tenant=acme&metric=latency_ms&agg=median&group_by=%5B%5D")
         self.assertEqual(code, 400)
         self.assertIn("error", body)
+    def test_window_query_over_http(self):
+        self.write({"host": "a"}, [[500, 1.0], [1000, 2.0], [1500, 4.0], [2500, 8.0]])
+        self.write({"host": "b"}, [[100, 9.0]])
+        code, body = self.request(
+            "GET", "/v1/query?tenant=acme&metric=latency_ms&label.host=a"
+                   "&start=1000&end=3000&step=500&agg=sum&window=1000")
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"series": [{
+            "labels": {"host": "a"},
+            "points": [[1000, 3.0], [1500, 6.0], [2000, 4.0],
+                       [2500, 8.0], [3000, 8.0]]}]})
+        # Grouped sliding-window query keeps the same result shape.
+        code, body = self.request(
+            "GET", "/v1/query?tenant=acme&metric=latency_ms&start=0&end=1000"
+                   "&step=1000&agg=count&window=1000&group_by=%5B%5D")
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"series": [{"labels": {}, "points": [[0, None], [1000, 3]]}]})
+    def test_window_query_errors_are_400(self):
+        self.write({}, [[1000, 1.0]])
+        base = "/v1/query?tenant=acme&metric=latency_ms&start=0&end=1000&step=100&agg=sum"
+        for path in (base,  # window given below is missing here -> old mode, ok
+                     base + "&window=0",
+                     base + "&window=-5",
+                     base + "&window=1.5",
+                     base + "&window=abc",
+                     base + "&window=1000&agg=median",
+                     "/v1/query?tenant=acme&metric=latency_ms&end=1000&step=100&agg=sum&window=1000",
+                     "/v1/query?tenant=acme&metric=latency_ms&start=0&step=100&agg=sum&window=1000",
+                     "/v1/query?tenant=acme&metric=latency_ms&start=0&end=1000&agg=sum&window=1000",
+                     "/v1/query?tenant=acme&metric=latency_ms&start=0&end=1000&step=100&window=1000",
+                     "/v1/query?tenant=acme&metric=latency_ms&start=1000&end=0&step=100&agg=sum&window=1000"):
+            code, body = self.request("GET", path)
+            if path == base:
+                self.assertEqual(code, 200)  # no window: existing behaviour
+                continue
+            self.assertEqual(code, 400, path)
+            self.assertIn("error", body)
     def test_quotas_set_get_usage_and_enforcement(self):
         code, body = self.request("GET", "/v1/quotas?tenant=acme")
         self.assertEqual(code, 200)

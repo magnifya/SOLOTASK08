@@ -38,6 +38,7 @@ stderr and exits non-zero.
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
+| `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg --window-ms 2000` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
@@ -55,7 +56,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=` (group_by is a JSON array of label keys) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=` (group_by is a JSON array of label keys; `window` enables sliding-window mode) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -124,6 +125,31 @@ raw samples are returned in `[timestamp, value]` order. `rollup(tenant, metric,
 labels, window_ms, agg)` is `query` with `step_ms = window_ms` over the whole
 stored range, with empty buckets dropped; output is ordered by `series_id`, so
 it is deterministic.
+
+**Sliding-window query.** `query(..., start_ms, end_ms, step_ms, agg,
+window_ms=window)` (HTTP `window=`, CLI `--window-ms`) switches to sliding-window
+mode, in which all four of `start_ms`, `end_ms`, `step_ms` and `agg` are
+required. Evaluation times are `start_ms + k*step_ms` for `k = 0, 1, ...` while
+the time stays `<= end_ms`, and the output timestamps are exactly those times —
+the step need not divide the window and nothing is aligned to epoch buckets.
+Each time `t` aggregates the raw samples in `(t - window_ms, t]`: the left
+boundary is excluded, the right boundary included, so the first window already
+reads history before `start_ms` and no sample after `t` is ever read. `sum`,
+`avg`, `min`, `max` and `count` keep their usual meaning, and an empty window
+yields `null` for every aggregation, including `count`. Every matching
+registered series emits the full time grid even when all of its windows are
+empty; no matching series yields an empty `series` array. With `group_by` the
+raw samples of every series in a group are pooled per window (same-timestamp
+samples from different series count individually, `avg` is over all pooled
+samples), groups keep the full grid, and grouping/ordering semantics match the
+fixed-bucket grouped query. `start_ms`/`end_ms` must be integer milliseconds
+and `step_ms`/`window_ms` positive integer milliseconds; booleans, floats,
+missing required settings, `end < start`, unknown aggregations and malformed
+`group_by` are rejected (`ObsError` / HTTP `400` / CLI JSON error with non-zero
+exit) and no partial result is returned. A window query reads one consistent
+snapshot of the store and changes no samples, counters or configuration, so
+repeating it after a restart over the same history gives the same result.
+Omitting `window_ms` keeps the fixed-bucket behaviour above.
 
 **Grouped query.** `query(..., agg=agg, group_by=[keys...])` aggregates *across*
 series: matching series (same tenant/metric/label filters and `[start_ms,
@@ -280,7 +306,10 @@ python3 -m unittest discover -s tests -v
 
 Covered: series identity and label-order independence, idempotent re-write,
 conflicting-timestamp rejection and `overwrite`, range filtering, epoch-aligned
-buckets, null buckets, all five aggregations, deterministic rollups, retention,
+buckets, null buckets, all five aggregations, deterministic rollups,
+sliding-window queries (left-open/right-closed windows, history before `start`,
+unaligned steps, null empty windows, full grids, grouped pooling, validation,
+read-only restarts) over the Python, HTTP and CLI surfaces, retention,
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label

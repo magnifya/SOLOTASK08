@@ -1,11 +1,15 @@
 """Tests for obsd.tsdb: identity, idempotency, query, aggregation, retention."""
 
+import contextlib
+import io
+import json
 import os
 import shutil
 import tempfile
 import unittest
 
 from obsd import ObsError, SeriesStore
+from obsd.cli import main as cli_main
 from obsd.tsdb import canonical_identity, series_id_for
 
 
@@ -186,6 +190,137 @@ class TestGroupBy(StoreCase):
         reopened = self.store()
         self.assertEqual(reopened.query("acme", "m", group_by=["region"], agg="avg"),
                          expected)
+class TestWindowQuery(StoreCase):
+    def fill(self, store):
+        store.write("acme", "m", {"k": "v"},
+                    [[500, 1.0], [1000, 2.0], [1500, 4.0], [2500, 8.0]])
+        return store
+    def test_sliding_window_reads_history_before_start(self):
+        store = self.fill(self.store())
+        rows = store.query("acme", "m", start_ms=1000, end_ms=3000,
+                           step_ms=500, agg="sum", window_ms=1000)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("series_id", rows[0])
+        # t=1000 sees (0,1000]: the sample at 500 predates start but counts.
+        self.assertEqual(rows[0]["points"], [[1000, 3.0], [1500, 6.0], [2000, 4.0],
+                                             [2500, 8.0], [3000, 8.0]])
+    def test_window_is_left_open_right_closed(self):
+        store = self.store()
+        store.write("acme", "m", {}, [[1000, 1.0], [2000, 2.0], [2001, 4.0]])
+        rows = store.query("acme", "m", start_ms=2000, end_ms=2000,
+                           step_ms=1000, agg="sum", window_ms=1000)
+        # (1000, 2000]: the sample at exactly t-window is excluded.
+        self.assertEqual(rows[0]["points"], [[2000, 2.0]])
+        rows = store.query("acme", "m", start_ms=2001, end_ms=2001,
+                           step_ms=1000, agg="sum", window_ms=1000)
+        self.assertEqual(rows[0]["points"], [[2001, 6.0]])
+    def test_step_need_not_divide_window_or_align_to_buckets(self):
+        store = self.fill(self.store())
+        rows = store.query("acme", "m", start_ms=333, end_ms=2433,
+                           step_ms=700, agg="count", window_ms=1000)
+        self.assertEqual([point[0] for point in rows[0]["points"]],
+                         [333, 1033, 1733, 2433])
+        # t=333 sees (-667,333]: empty windows are null even for count.
+        self.assertEqual([point[1] for point in rows[0]["points"]],
+                         [None, 2, 2, 1])
+    def test_empty_windows_are_null_for_every_aggregation(self):
+        store = self.fill(self.store())
+        for agg in ("sum", "avg", "min", "max", "count"):
+            rows = store.query("acme", "m", start_ms=3000, end_ms=4000,
+                               step_ms=1000, agg=agg, window_ms=400)
+            self.assertEqual(rows[0]["points"],
+                             [[3000, None], [4000, None]], agg)
+    def test_full_grid_for_series_with_only_empty_windows(self):
+        store = self.fill(self.store())
+        store.write("acme", "m", {"k": "w"}, [[100, 9.0]])
+        rows = store.query("acme", "m", start_ms=5000, end_ms=7000,
+                           step_ms=1000, agg="avg", window_ms=500)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["points"],
+                             [[5000, None], [6000, None], [7000, None]])
+        self.assertEqual(store.query("acme", "nope", start_ms=0, end_ms=1000,
+                                     step_ms=100, agg="sum", window_ms=100), [])
+    def test_window_group_by_pools_raw_samples(self):
+        store = self.store()
+        store.write("acme", "m", {"host": "a", "region": "x"}, [[1000, 1.0]])
+        store.write("acme", "m", {"host": "b", "region": "x"}, [[1000, 3.0]])
+        store.write("acme", "m", {"host": "c"}, [[1000, 100.0]])
+        store.write("acme", "m", {"host": "d", "region": ""}, [[9000, 5.0]])
+        rows = store.query("acme", "m", group_by=["region"], agg="avg",
+                           start_ms=1000, end_ms=2000, step_ms=1000, window_ms=1000)
+        self.assertEqual([row["labels"] for row in rows],
+                         [{}, {"region": ""}, {"region": "x"}])
+        # Same-timestamp samples from different series count individually.
+        self.assertEqual(rows[2]["points"], [[1000, 2.0], [2000, None]])
+        self.assertEqual(rows[0]["points"], [[1000, 100.0], [2000, None]])
+        # An all-empty group keeps the full time grid.
+        self.assertEqual(rows[1]["points"], [[1000, None], [2000, None]])
+        self.assertNotIn("series_id", rows[0])
+        counts = store.query("acme", "m", group_by=["region"], agg="count",
+                             start_ms=1000, end_ms=1000, step_ms=1000, window_ms=1000)
+        region_x = [row for row in counts if row["labels"] == {"region": "x"}][0]
+        self.assertEqual(region_x["points"], [[1000, 2]])
+    def test_window_query_validation(self):
+        store = self.fill(self.store())
+        base = {"start_ms": 0, "end_ms": 1000, "step_ms": 100,
+                "agg": "sum", "window_ms": 500}
+        # Missing required settings.
+        for field in ("start_ms", "end_ms", "step_ms", "agg"):
+            kwargs = dict(base, **{field: None})
+            with self.assertRaises(ObsError, msg=field):
+                store.query("acme", "m", **kwargs)
+        # Booleans and floats are not integer milliseconds.
+        for field in ("start_ms", "end_ms", "step_ms", "window_ms"):
+            for bad in (True, 1.5):
+                kwargs = dict(base, **{field: bad})
+                with self.assertRaises(ObsError, msg="%s=%r" % (field, bad)):
+                    store.query("acme", "m", **kwargs)
+        # Non-positive step/window, end before start, unknown aggregation.
+        for kwargs in (dict(base, step_ms=0), dict(base, step_ms=-5),
+                       dict(base, window_ms=0), dict(base, window_ms=-1),
+                       dict(base, start_ms=1000, end_ms=999),
+                       dict(base, agg="median")):
+            with self.assertRaises(ObsError, msg=repr(kwargs)):
+                store.query("acme", "m", **kwargs)
+        # Invalid group_by settings.
+        for bad in ("host", ["host", "host"], [""], [1], {"host": 1}):
+            with self.assertRaises(ObsError, msg=repr(bad)):
+                store.query("acme", "m", group_by=bad, **base)
+    def test_window_query_is_read_only_and_survives_reopen(self):
+        store = self.fill(self.store())
+        before = store.stats()
+        expected = store.query("acme", "m", start_ms=0, end_ms=3000,
+                               step_ms=500, agg="avg", window_ms=1000)
+        self.assertEqual(store.stats(), before)
+        reopened = self.store()
+        self.assertEqual(reopened.query("acme", "m", start_ms=0, end_ms=3000,
+                                        step_ms=500, agg="avg", window_ms=1000),
+                         expected)
+class TestWindowCli(StoreCase):
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli_main(["--data-dir", os.path.join(self.tmp, "data")] + list(argv))
+        return code, out.getvalue(), err.getvalue()
+    def test_cli_window_query_and_error(self):
+        store = self.store()
+        store.write("acme", "m", {"k": "v"}, [[500, 1.0], [1000, 2.0]])
+        code, out, err = self.run_cli(
+            "query", "--tenant", "acme", "--metric", "m",
+            "--start", "1000", "--end", "2000", "--step", "1000",
+            "--agg", "sum", "--window-ms", "1000")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(json.loads(out), {"series": [{
+            "labels": {"k": "v"}, "points": [[1000, 3.0], [2000, None]]}]})
+        # A missing required setting is one JSON error on stderr, non-zero exit.
+        code, out, err = self.run_cli(
+            "query", "--tenant", "acme", "--metric", "m",
+            "--start", "0", "--end", "2000", "--agg", "sum", "--window-ms", "1000")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertIn("error", json.loads(err))
 class TestRetentionAndPersistence(StoreCase):
     def test_enforce_retention_drops_old_points(self):
         store = self.store()
