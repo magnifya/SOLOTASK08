@@ -34,6 +34,8 @@ stderr and exits non-zero.
 | Command | Example |
 | --- | --- |
 | `serve` | `python3 -m obsd --data-dir ./obsd_data serve --host 127.0.0.1 --port 8080` |
+| `quota-set` | `python3 -m obsd quota-set --tenant acme --max-series 1000 --max-points 1000000` |
+| `quota-get` | `python3 -m obsd quota-get --tenant acme` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
@@ -46,13 +48,15 @@ stderr and exits non-zero.
 ## HTTP API
 
 Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
-404 (unknown resource) or 409 (write conflict).
+404 (unknown resource) or 409 (write conflict or quota exceeded).
 
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
-| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp |
+| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=` | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
+| GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -81,10 +85,15 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 ```
 <data-dir>/series.json              registry: series_id -> tenant/metric/labels
 <data-dir>/points/<series_id>.jsonl one {"t":ts,"v":value} object per line
+<data-dir>/quotas.json              tenant -> {"max_series","max_points"} limits
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
 ```
+
+A directory written before quotas existed simply has no `quotas.json`, which
+means every tenant is unlimited; limits and usage are reloaded together on
+construction so a reopen always reports a consistent snapshot.
 
 `SeriesStore` and `AlertEngine` each guard their state with a
 `threading.RLock`, so the threaded HTTP server can serve concurrent requests; all
@@ -118,6 +127,31 @@ it is deterministic.
 **Retention.** `enforce_retention(tenant, cutoff_ms)` removes every sample of
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point
 files. `stats()` returns `{"series","points","writes","tenants"}`.
+
+**Per-tenant quotas.** `set_quota(tenant, max_series, max_points)` sets the
+tenant-wide limits; each limit is a non-negative integer or `null` (omitted
+fields over HTTP also mean `null`, i.e. unlimited), and `0` forbids adding any.
+`get_quota(tenant)` returns
+`{"tenant","max_series","max_points","series","points"}` — the configured
+limits and the current usage in one snapshot. Configuring a quota never creates
+a series, and an unconfigured tenant is unlimited. Limits apply to all of a
+tenant's metrics together: `series` is the number of registered series and
+`points` the total number of *distinct timestamps* across those series, not
+physical point-file lines. Label order, same-value replays, overwritten points
+and a timestamp repeated inside one batch add no occupancy.
+
+Every write path (`SeriesStore.write`, `POST /v1/series`, the CLI `write`) is
+checked after the existing input validation and conflict rules, using the
+batch's net increase: a batch is rejected (ObsError / HTTP `409` / CLI JSON
+error with non-zero exit) when *either* dimension it increases would exceed its
+limit, and the rejection leaves no new series, samples or write-count change.
+Limits may be lowered below current usage; afterwards only the dimensions a
+write actually increases are checked — an already-over-limit dimension blocks
+nothing by itself, so pure duplicates and overwrites keep succeeding. Retention
+frees the occupancy of deleted points, while empty series stay registered.
+Overwrites rewrite the point file so one timestamp never occupies two lines; on
+reopen, any duplicate timestamp lines (including those left by older builds)
+collapse to the last value, so historical re-overwrites never double-count.
 
 **Rule shape.** `{"id","tenant","metric","labels","comparator" ∈ {">",">=","<",
 "<=","==","!="},"threshold","for_ms","window_ms","agg","severity" ∈ {"info",
@@ -232,8 +266,12 @@ buckets, null buckets, all five aggregations, deterministic rollups, retention,
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label
-set, SLO/error-budget/burn-rate math (including the empty window), and the live
-HTTP surface over a real socket.
+set, SLO/error-budget/burn-rate math (including the empty window), quota
+configuration/validation, net-increase enforcement and whole-batch rejection,
+zero/lowered limits with duplicates and overwrites, tenant isolation, quota
+release under retention, quota/usage consistency after reopen (including
+collapsed duplicate timestamp lines), concurrent writes/reconfiguration/pruning,
+and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the
 modules never read the wall clock inside decision logic.

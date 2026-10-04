@@ -41,6 +41,14 @@ def dispatch(store, engine, method, path, params, payload):
         return 200, {"ok": True}
     if (method, path) == ("GET", "/v1/stats"):
         return 200, {"store": store.stats(), "alerts": len(engine.list_alerts())}
+    if (method, path) == ("POST", "/v1/quotas"):
+        # Omitted limits default to unlimited; the store validates tenant and
+        # limits and raises ObsError (-> 400) without touching the config.
+        return 200, store.set_quota(_require(payload, "tenant"),
+                                    payload.get("max_series"),
+                                    payload.get("max_points"))
+    if (method, path) == ("GET", "/v1/quotas"):
+        return 200, store.get_quota(_require(params, "tenant"))
     if (method, path) == ("POST", "/v1/series"):
         result = store.write(_require(payload, "tenant"), _require(payload, "metric"),
                              _labels(payload), _require(payload, "samples"),
@@ -88,7 +96,7 @@ def dispatch(store, engine, method, path, params, payload):
 def _status_for(message):
     if message.startswith(("not found", "unknown")):
         return 404
-    return 409 if message.startswith("conflict") else 400
+    return 409 if message.startswith(("conflict", "quota exceeded")) else 400
 def make_handler(store, engine):
     class ObsdHandler(BaseHTTPRequestHandler):
         server_version = "obsd/0.1"

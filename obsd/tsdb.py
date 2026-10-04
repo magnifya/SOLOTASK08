@@ -115,6 +115,7 @@ class SeriesStore:
 
         <root>/series.json                 registry: series_id -> series row
         <root>/points/<series_id>.jsonl    one ``{"t":ts,"v":value}`` per line
+        <root>/quotas.json                 tenant -> {"max_series", "max_points"}
     """
 
     def __init__(self, root):
@@ -123,10 +124,13 @@ class SeriesStore:
         self.root = os.path.abspath(str(root))
         self.points_dir = os.path.join(self.root, "points")
         self.series_path = os.path.join(self.root, "series.json")
+        self.quota_path = os.path.join(self.root, "quotas.json")
         self._lock = threading.RLock()
         self._series, self._samples, self._writes = {}, {}, 0
+        self._quotas = {}
         os.makedirs(self.points_dir, exist_ok=True)
         self._load()
+        self._load_quotas()
 
     def _points_path(self, sid):
         return os.path.join(self.points_dir, sid + ".jsonl")
@@ -151,18 +155,23 @@ class SeriesStore:
             self._samples[sid] = self._read_points(sid)
 
     def _read_points(self, sid):
-        """Reload one point file, skipping unreadable lines."""
-        rows = []
+        """Reload one point file, skipping unreadable lines.
+
+        Repeated lines for the same timestamp (left behind by historical
+        overwrites) collapse to the last value stored, so occupancy counts each
+        distinct timestamp once after a reopen.
+        """
+        rows = {}
         path = self._points_path(sid)
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     try:
                         row = json.loads(line)
-                        rows.append((int(row["t"]), float(row["v"])))
+                        rows[int(row["t"])] = float(row["v"])
                     except (ValueError, KeyError, TypeError):
                         continue
-        return sorted(rows)
+        return sorted(rows.items())
 
     def _save_registry(self):
         _atomic_write(self.series_path, json.dumps(
@@ -173,23 +182,89 @@ class SeriesStore:
         _atomic_write(self._points_path(sid),
                       "".join(_line(ts, value) for ts, value in self._samples[sid]))
 
-    # ------------------------------------------------------------------- write
-    def _ensure_series(self, tenant, metric, labels):
-        pairs = _labels_list(labels)
-        identity = canonical_identity(tenant, metric, pairs)
-        sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        if sid not in self._series:
-            self._series[sid] = {"series_id": sid, "tenant": tenant, "metric": metric,
-                                 "labels": pairs, "identity": identity}
-            self._samples[sid] = []
-        return sid
+    # ------------------------------------------------------------------ quotas
+    def _load_quotas(self):
+        """Reload ``quotas.json``; a missing file means every tenant is unlimited."""
+        if not os.path.exists(self.quota_path):
+            return
+        try:
+            with open(self.quota_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ObsError("cannot read quota config: %s" % exc)
+        if not isinstance(data, dict):
+            raise ObsError("cannot read quota config: root must be an object")
+        for tenant, row in data.items():
+            if not isinstance(tenant, str) or not tenant or not isinstance(row, dict):
+                raise ObsError("cannot read quota config: malformed entry")
+            self._quotas[tenant] = {
+                "max_series": self._clean_limit(row.get("max_series"), "max_series"),
+                "max_points": self._clean_limit(row.get("max_points"), "max_points")}
 
+    @staticmethod
+    def _clean_limit(value, field):
+        """A limit is a non-negative integer or ``None`` (unlimited)."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ObsError("%s must be a non-negative integer or null" % field)
+        if value < 0:
+            raise ObsError("%s must be a non-negative integer or null" % field)
+        return value
+
+    @staticmethod
+    def _clean_tenant(tenant):
+        if not isinstance(tenant, str) or not tenant:
+            raise ObsError("tenant must be a non-empty string")
+        return tenant
+
+    def _save_quotas(self):
+        _atomic_write(self.quota_path, json.dumps(
+            {tenant: self._quotas[tenant] for tenant in sorted(self._quotas)},
+            sort_keys=True, separators=(",", ":")))
+
+    def set_quota(self, tenant, max_series, max_points):
+        """Configure the per-tenant limits; ``None`` means unlimited.
+
+        Limits may be lowered below current usage; pure duplicate/overwrite
+        writes stay allowed afterwards. Configuring a quota never creates a
+        series.
+        """
+        tenant = self._clean_tenant(tenant)
+        max_series = self._clean_limit(max_series, "max_series")
+        max_points = self._clean_limit(max_points, "max_points")
+        with self._lock:
+            self._quotas[tenant] = {"max_series": max_series, "max_points": max_points}
+            self._save_quotas()
+            return self.get_quota(tenant)
+
+    def get_quota(self, tenant):
+        """Return limits and current usage for ``tenant`` in one snapshot."""
+        tenant = self._clean_tenant(tenant)
+        with self._lock:
+            limits = self._quotas.get(tenant, {"max_series": None, "max_points": None})
+            series = points = 0
+            for sid, row in self._series.items():
+                if row["tenant"] == tenant:
+                    series += 1
+                    points += len(self._samples[sid])
+            return {"tenant": tenant, "max_series": limits["max_series"],
+                    "max_points": limits["max_points"], "series": series, "points": points}
+
+    # ------------------------------------------------------------------- write
     def write(self, tenant, metric, labels, samples, now=None, overwrite=False):
         """Store ``samples`` = ``[(timestamp_ms, value), ...]``.
 
         Idempotent: an identical ``(series, timestamp)`` value is a duplicate
         and changes nothing. A differing value for a stored timestamp raises
         ``ObsError`` unless ``overwrite=True``.
+
+        The whole batch is checked against the tenant's configured quotas
+        *after* input validation and conflict rules, using the net new series
+        and distinct new timestamps the batch would add (same-value replays,
+        overwrites and timestamps repeated inside the batch add nothing). A
+        batch that would exceed either limit is rejected wholesale with
+        ``ObsError``: no series, points or write counter change is kept.
         """
         if not isinstance(samples, (list, tuple)):
             raise ObsError("samples must be a list of [timestamp_ms, value] pairs")
@@ -206,27 +281,73 @@ class SeriesStore:
             clean.append((int(stamp), float(value)))
         if not clean:
             raise ObsError("samples must not be empty")
+        # Labels/tenant are validated before the lock so conflicts and quota
+        # breaches never surface as identity errors.
+        pairs = _labels_list(labels)
+        identity = canonical_identity(tenant, metric, pairs)
+        sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         with self._lock:
-            sid = self._ensure_series(tenant, metric, labels)
-            merged = dict(self._samples[sid])
+            existed = sid in self._series
+            current = dict(self._samples.get(sid, ()))
+            merged = dict(current)
             written = duplicates = 0
-            fresh = []
+            new_stamps = set()
+            overwritten = False
             for stamp, value in clean:
-                if stamp in merged and merged[stamp] != value and not overwrite:
-                    raise ObsError("conflict for %s at timestamp %d: stored=%r incoming=%r"
-                                   % (sid, stamp, merged[stamp], value))
-                if stamp in merged and merged[stamp] == value:
-                    duplicates += 1
-                    continue
+                if stamp in merged:
+                    if merged[stamp] != value:
+                        if not overwrite:
+                            raise ObsError(
+                                "conflict for %s at timestamp %d: stored=%r incoming=%r"
+                                % (sid, stamp, merged[stamp], value))
+                        if stamp in current:
+                            overwritten = True
+                    else:
+                        duplicates += 1
+                        continue
+                else:
+                    new_stamps.add(stamp)
                 merged[stamp] = value
-                fresh.append((stamp, value))
                 written += 1
-            if fresh:
+
+            quota = self._quotas.get(tenant)
+            if quota is not None:
+                used_series = used_points = 0
+                for sid_, row in self._series.items():
+                    if row["tenant"] == tenant:
+                        used_series += 1
+                        used_points += len(self._samples[sid_])
+                new_series = 0 if existed else 1
+                new_points = len(new_stamps)
+                limit_series = quota["max_series"]
+                limit_points = quota["max_points"]
+                if new_series and limit_series is not None \
+                        and used_series + new_series > limit_series:
+                    raise ObsError(
+                        "quota exceeded for tenant %r: series %d+%d > max_series %s"
+                        % (tenant, used_series, new_series, limit_series))
+                if new_points and limit_points is not None \
+                        and used_points + new_points > limit_points:
+                    raise ObsError(
+                        "quota exceeded for tenant %r: points %d+%d > max_points %s"
+                        % (tenant, used_points, new_points, limit_points))
+
+            if not existed:
+                self._series[sid] = {"series_id": sid, "tenant": tenant, "metric": metric,
+                                     "labels": pairs, "identity": identity}
+                self._samples[sid] = []
+            if written:
                 self._samples[sid] = sorted(merged.items())
-                with open(self._points_path(sid), "a", encoding="utf-8") as handle:
-                    handle.write("".join(_line(ts, value) for ts, value in sorted(fresh)))
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                if overwritten:
+                    # An overwrite replaced a stored value: rewrite the file so a
+                    # timestamp never occupies more than one physical line.
+                    self._rewrite_points(sid)
+                else:
+                    fresh = sorted((stamp, merged[stamp]) for stamp in new_stamps)
+                    with open(self._points_path(sid), "a", encoding="utf-8") as handle:
+                        handle.write("".join(_line(ts, value) for ts, value in fresh))
+                        handle.flush()
+                        os.fsync(handle.fileno())
                 self._writes += 1
                 self._save_registry()
         return {"series_id": sid, "written": written, "duplicates": duplicates}

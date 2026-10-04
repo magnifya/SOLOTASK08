@@ -108,6 +108,53 @@ class TestHttpApi(HttpCase):
         code, body = self.request("POST", "/v1/evaluate", {})
         self.assertEqual(code, 400)
         self.assertIn("now_ms", body["error"])
+    def test_quotas_set_get_usage_and_enforcement(self):
+        code, body = self.request("GET", "/v1/quotas?tenant=acme")
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"tenant": "acme", "max_series": None, "max_points": None,
+                                "series": 0, "points": 0})
+        code, body = self.request("POST", "/v1/quotas",
+                                  {"tenant": "acme", "max_series": 1, "max_points": 2})
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"tenant": "acme", "max_series": 1, "max_points": 2,
+                                "series": 0, "points": 0})
+        self.write({}, [[1000, 1.0], [2000, 2.0]])
+        code, body = self.request("GET", "/v1/quotas?tenant=acme")
+        self.assertEqual((code, body["series"], body["points"]), (200, 1, 2))
+        # A batch exceeding max_points is rejected with 409 and changes nothing.
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {},
+            "samples": [[2000, 2.0], [3000, 3.0]]})
+        self.assertEqual(code, 409)
+        self.assertIn("quota exceeded", body["error"])
+        code, body = self.request("GET", "/v1/quotas?tenant=acme")
+        self.assertEqual((body["series"], body["points"]), (1, 2))
+        # Duplicates and overwrites still succeed at the limit.
+        self.write({}, [[1000, 1.0]])
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {},
+            "samples": [[1000, 9.0]], "overwrite": True})
+        self.assertEqual(code, 202)
+        # A second series hits max_series with 409.
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {"host": "b"},
+            "samples": [[1000, 1.0]]})
+        self.assertEqual(code, 409)
+        self.assertIn("max_series", body["error"])
+    def test_invalid_quota_requests_return_400_and_keep_config(self):
+        self.request("POST", "/v1/quotas", {"tenant": "acme", "max_series": 1, "max_points": 4})
+        for bad in (True, "1", 1.5, -1):
+            code, body = self.request("POST", "/v1/quotas",
+                                      {"tenant": "acme", "max_series": bad, "max_points": 4})
+            self.assertEqual(code, 400, repr(bad))
+            self.assertIn("error", body)
+        code, body = self.request("POST", "/v1/quotas",
+                                  {"tenant": "", "max_series": 1, "max_points": 1})
+        self.assertEqual(code, 400)
+        code, body = self.request("GET", "/v1/quotas")
+        self.assertEqual(code, 400)
+        code, body = self.request("GET", "/v1/quotas?tenant=acme")
+        self.assertEqual((code, body["max_series"], body["max_points"]), (200, 1, 4))
     def test_slo_set_and_status(self):
         self.write({}, [[index * 1000, 1.0 if index else 0.0] for index in range(10)])
         code, slo = self.request("POST", "/v1/slos", {

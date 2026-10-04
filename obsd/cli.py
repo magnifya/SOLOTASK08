@@ -60,6 +60,16 @@ def _build_parser():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
 
+    quota_set = sub.add_parser("quota-set", help="set per-tenant write limits")
+    quota_set.add_argument("--tenant", required=True)
+    quota_set.add_argument("--max-series", type=int, default=None,
+                           help="max registered series (omit for unlimited)")
+    quota_set.add_argument("--max-points", type=int, default=None,
+                           help="max distinct points across the tenant (omit for unlimited)")
+
+    quota_get = sub.add_parser("quota-get", help="show a tenant's limits and usage")
+    quota_get.add_argument("--tenant", required=True)
+
     write = _common(sub.add_parser("write", help="write samples into a series"))
     write.add_argument("--sample", action="append", default=[], metavar="TS:VALUE")
     write.add_argument("--now-ms", type=int, default=None)
@@ -111,7 +121,11 @@ def _build_parser():
 def _run(args, store, engine):
     if args.command == "serve":
         return run_server(store, engine, args.host, args.port)
-    if args.command == "write":
+    if args.command == "quota-set":
+        _emit(store.set_quota(args.tenant, args.max_series, args.max_points))
+    elif args.command == "quota-get":
+        _emit(store.get_quota(args.tenant))
+    elif args.command == "write":
         _emit(store.write(args.tenant, args.metric, _labels(args.label),
                           _samples(args.sample), now=args.now_ms, overwrite=args.overwrite))
     elif args.command == "query":
