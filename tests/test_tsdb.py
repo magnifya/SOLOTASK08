@@ -116,6 +116,76 @@ class TestQuery(StoreCase):
         self.assertEqual(sorted(by_labels), ["a", "b"])
         self.assertEqual(by_labels["a"], [[0, 4.0], [10000, 5.0]])
         self.assertEqual(by_labels["b"], [[0, 3.0]])
+class TestGroupBy(StoreCase):
+    def fill(self, store):
+        store.write("acme", "m", {"host": "a", "region": "x"}, [[0, 1.0], [1000, 3.0]])
+        store.write("acme", "m", {"host": "b", "region": "x"}, [[1000, 9.0]])
+        store.write("acme", "m", {"host": "a"}, [[500, 5.0]])
+        store.write("acme", "m", {"host": "a", "region": ""}, [[700, 7.0]])
+        store.write("acme", "m", {"host": "c", "region": "x"}, [[9000, 1.0]])
+        return store
+    def test_group_aggregates_pooled_raw_samples(self):
+        store = self.fill(self.store())
+        rows = store.query("acme", "m", group_by=["region"], agg="avg",
+                           start_ms=0, end_ms=2000)
+        # Groups ordered by their sorted label pairs; a missing key and an
+        # empty-string value are different groups.
+        self.assertEqual([row["labels"] for row in rows],
+                         [{}, {"region": ""}, {"region": "x"}])
+        # (1+3+9)/3: samples at the same timestamp count individually.
+        self.assertEqual(rows[2]["points"], [[0, 13.0 / 3.0]])
+        self.assertEqual(rows[1]["points"], [[700, 7.0]])
+        self.assertEqual(rows[0]["points"], [[500, 5.0]])
+        self.assertNotIn("series_id", rows[0])
+    def test_empty_group_by_merges_all_series(self):
+        store = self.fill(self.store())
+        rows = store.query("acme", "m", group_by=[], agg="sum")
+        self.assertEqual(rows, [{"labels": {}, "points": [[0, 26.0]]}])
+    def test_grouped_step_buckets_with_null_gaps(self):
+        store = self.fill(self.store())
+        rows = store.query("acme", "m", group_by=["region"], agg="sum",
+                           step_ms=1000, start_ms=0, end_ms=2000)
+        region_x = [row for row in rows if row["labels"] == {"region": "x"}][0]
+        self.assertEqual(region_x["points"], [[0, 1.0], [1000, 12.0]])
+        store.write("acme", "m", {"host": "d"}, [[0, 2.0], [9000, 4.0]])
+        rows = store.query("acme", "m", labels={"host": "d"}, group_by=[],
+                           agg="sum", step_ms=3000)
+        self.assertEqual(rows[0]["points"],
+                         [[0, 2.0], [3000, None], [6000, None], [9000, 4.0]])
+    def test_group_without_samples_in_range_is_listed_empty(self):
+        store = self.fill(self.store())
+        rows = store.query("acme", "m", group_by=["host"], agg="sum",
+                           start_ms=0, end_ms=2000)
+        host_c = [row for row in rows if row["labels"] == {"host": "c"}][0]
+        self.assertEqual(host_c["points"], [])
+        rows = store.query("acme", "m", group_by=["host"], agg="sum",
+                           step_ms=1000, start_ms=0, end_ms=2000)
+        host_c = [row for row in rows if row["labels"] == {"host": "c"}][0]
+        self.assertEqual(host_c["points"], [])
+        self.assertEqual(store.query("acme", "nope", group_by=["host"], agg="sum"), [])
+    def test_group_by_key_order_is_irrelevant(self):
+        store = self.fill(self.store())
+        one = store.query("acme", "m", group_by=["host", "region"], agg="count")
+        two = store.query("acme", "m", group_by=["region", "host"], agg="count")
+        self.assertEqual(one, two)
+        self.assertEqual([row["labels"] for row in one], [
+            {"host": "a"}, {"host": "a", "region": ""}, {"host": "a", "region": "x"},
+            {"host": "b", "region": "x"}, {"host": "c", "region": "x"}])
+    def test_group_by_validation(self):
+        store = self.fill(self.store())
+        for bad in ("host", ["host", "host"], [""], [1], {"host": 1}):
+            with self.assertRaises(ObsError, msg=repr(bad)):
+                store.query("acme", "m", group_by=bad, agg="sum")
+        with self.assertRaises(ObsError):
+            store.query("acme", "m", group_by=["host"])
+        with self.assertRaises(ObsError):
+            store.query("acme", "m", group_by=["host"], agg="median")
+    def test_grouped_query_survives_reopen(self):
+        store = self.fill(self.store())
+        expected = store.query("acme", "m", group_by=["region"], agg="avg")
+        reopened = self.store()
+        self.assertEqual(reopened.query("acme", "m", group_by=["region"], agg="avg"),
+                         expected)
 class TestRetentionAndPersistence(StoreCase):
     def test_enforce_retention_drops_old_points(self):
         store = self.store()

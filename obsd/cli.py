@@ -80,6 +80,9 @@ def _build_parser():
     query.add_argument("--end", type=int, default=None)
     query.add_argument("--step", type=int, default=None)
     query.add_argument("--agg", choices=AGGS, default=None)
+    query.add_argument("--group-by", default=None, metavar="JSON_ARRAY",
+                       help="JSON array of label keys for cross-series grouping "
+                            "(requires --agg; [] merges all matching series)")
 
     rule = _common(sub.add_parser("rule-add", help="add an alert rule"))
     rule.add_argument("--id", default=None)
@@ -129,8 +132,15 @@ def _run(args, store, engine):
         _emit(store.write(args.tenant, args.metric, _labels(args.label),
                           _samples(args.sample), now=args.now_ms, overwrite=args.overwrite))
     elif args.command == "query":
+        group_by = None
+        if args.group_by is not None:
+            try:
+                group_by = json.loads(args.group_by)
+            except ValueError:
+                raise ObsError("--group-by must be a JSON array of label keys")
         rows = store.query(args.tenant, args.metric, labels=_labels(args.label),
-                           start_ms=args.start, end_ms=args.end, step_ms=args.step, agg=args.agg)
+                           start_ms=args.start, end_ms=args.end, step_ms=args.step,
+                           agg=args.agg, group_by=group_by)
         _emit({"series": [{"labels": row["labels"], "points": row["points"]} for row in rows]})
     elif args.command == "rule-add":
         _emit(engine.add_rule({

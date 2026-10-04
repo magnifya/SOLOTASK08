@@ -377,13 +377,20 @@ class SeriesStore:
         return out
 
     def query(self, tenant, metric, labels=None, start_ms=None, end_ms=None,
-              step_ms=None, agg=None):
+              step_ms=None, agg=None, group_by=None):
         """Raw or bucketed points per matching series.
 
         ``step_ms`` buckets are left-closed/right-open on epoch multiples and
         empty buckets are emitted as ``None``. A series with no sample in range
         is still listed, with an empty ``points`` list, unless ``agg`` is used
         without ``step_ms`` (then it yields nothing and is omitted).
+
+        ``group_by=None`` keeps this per-series behaviour. Otherwise it must
+        be a list of distinct non-empty label keys (``[]`` merges every match
+        into one group) and ``agg`` is required: the raw in-range samples of
+        all series in a group are aggregated together and each result row
+        carries only ``labels`` (the group keys present on those series) and
+        ``points``.
         """
         if agg is not None and agg not in AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
@@ -393,6 +400,9 @@ class SeriesStore:
         hi = None if end_ms is None else int(end_ms)
         if lo is not None and hi is not None and hi < lo:
             raise ObsError("end_ms must be >= start_ms")
+        if group_by is not None:
+            return self._query_grouped(tenant, metric, labels, lo, hi,
+                                       step_ms, agg, group_by)
         out = []
         for sid, samples in self._samples_for(tenant, metric, labels):
             rows = [item for item in samples
@@ -421,6 +431,47 @@ class SeriesStore:
         end = min(keys[-1], hi - (hi % step)) if hi is not None else keys[-1]
         return [[key, _aggregate(groups[key], agg) if key in groups else None]
                 for key in range(start, end + 1, step)]
+
+    def _query_grouped(self, tenant, metric, labels, lo, hi, step_ms, agg, group_by):
+        """Cross-series aggregation: one row per distinct ``group_by`` tuple.
+
+        The raw in-range samples of every series in a group are pooled before
+        aggregating (no per-series pre-averaging), so samples from different
+        series at the same timestamp each count. A group key absent from a
+        series simply does not appear in that group's labels; a missing key
+        and an empty-string value therefore land in different groups.
+        """
+        if not isinstance(group_by, (list, tuple)):
+            raise ObsError("group_by must be a list of label keys")
+        keys = list(group_by)
+        for key in keys:
+            if not isinstance(key, str) or not key:
+                raise ObsError("group_by entries must be non-empty strings")
+        if len(set(keys)) != len(keys):
+            raise ObsError("group_by entries must not contain duplicates")
+        if agg is None:
+            raise ObsError("group_by requires agg")
+        groups = {}
+        for sid, samples in self._samples_for(tenant, metric, labels):
+            series_labels = dict(self._series[sid]["labels"])
+            group_labels = {key: series_labels[key] for key in keys
+                            if key in series_labels}
+            token = tuple(sorted(group_labels.items()))
+            entry = groups.setdefault(token, {"labels": group_labels, "rows": []})
+            entry["rows"].extend(item for item in samples
+                                 if (lo is None or item[0] >= lo)
+                                 and (hi is None or item[0] <= hi))
+        out = []
+        for token in sorted(groups):
+            entry = groups[token]
+            rows = sorted(entry["rows"])
+            if step_ms is None:
+                points = [] if not rows else \
+                    [[rows[0][0], _aggregate([value for _, value in rows], agg)]]
+            else:
+                points = self._bucket(rows, step_ms, agg, lo, hi) or []
+            out.append({"labels": entry["labels"], "points": points})
+        return out
 
     def rollup(self, tenant, metric, labels, window_ms, agg):
         """Downsampled series over the whole stored range, ordered by series_id."""

@@ -108,6 +108,29 @@ class TestHttpApi(HttpCase):
         code, body = self.request("POST", "/v1/evaluate", {})
         self.assertEqual(code, 400)
         self.assertIn("now_ms", body["error"])
+    def test_group_by_query_and_errors(self):
+        self.write({"host": "a"}, [[0, 1.0], [1000, 3.0]])
+        self.write({"host": "b"}, [[1000, 9.0]])
+        code, body = self.request(
+            "GET", "/v1/query?tenant=acme&metric=latency_ms&agg=avg&group_by=%5B%22host%22%5D")
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"series": [
+            {"labels": {"host": "a"}, "points": [[0, 2.0]]},
+            {"labels": {"host": "b"}, "points": [[1000, 9.0]]}]})
+        # An empty group_by array merges every matching series into one group.
+        code, body = self.request(
+            "GET", "/v1/query?tenant=acme&metric=latency_ms&agg=avg&group_by=%5B%5D")
+        self.assertEqual(body, {"series": [{"labels": {}, "points": [[0, 13.0 / 3.0]]}]})
+        # Malformed group_by values are 400 with the usual error object.
+        for group_by in ("[host", "%22host%22", "%5B%22host%22%2C%22host%22%5D", "%5B%5D"):
+            code, body = self.request(
+                "GET", "/v1/query?tenant=acme&metric=latency_ms&group_by=" + group_by)
+            self.assertEqual(code, 400, group_by)
+            self.assertIn("error", body)
+        code, body = self.request(
+            "GET", "/v1/query?tenant=acme&metric=latency_ms&agg=median&group_by=%5B%5D")
+        self.assertEqual(code, 400)
+        self.assertIn("error", body)
     def test_quotas_set_get_usage_and_enforcement(self):
         code, body = self.request("GET", "/v1/quotas?tenant=acme")
         self.assertEqual(code, 200)

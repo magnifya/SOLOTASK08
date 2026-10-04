@@ -38,6 +38,7 @@ stderr and exits non-zero.
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
+| `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
@@ -54,7 +55,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=` | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=` (group_by is a JSON array of label keys) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -123,6 +124,23 @@ raw samples are returned in `[timestamp, value]` order. `rollup(tenant, metric,
 labels, window_ms, agg)` is `query` with `step_ms = window_ms` over the whole
 stored range, with empty buckets dropped; output is ordered by `series_id`, so
 it is deterministic.
+
+**Grouped query.** `query(..., agg=agg, group_by=[keys...])` aggregates *across*
+series: matching series (same tenant/metric/label filters and `[start_ms,
+end_ms]` range as above) are bucketed into groups by the values of the given
+label keys, and the raw in-range samples of all series in a group are pooled
+before `agg` is applied — samples from different series at the same timestamp
+count individually. `group_by=[]` merges every matching series into one group.
+Each result row carries only `labels` (the group keys actually present on the
+group's series — a missing key and an empty-string value form different
+groups) and `points`; rows are ordered lexicographically by their sorted label
+pairs. Bucketing follows the same rules as the per-series query (epoch-aligned
+left-closed buckets with `null` gaps, or a single point at the group's
+earliest sample without `step_ms`). A group whose series have no sample in
+range is still listed with empty `points`; no matching series at all yields an
+empty `series` array. `group_by` must be a list of distinct non-empty strings
+and requires `agg`; violations raise `ObsError` (`400` over HTTP, one JSON
+error line on stderr for the CLI).
 
 **Retention.** `enforce_retention(tenant, cutoff_ms)` removes every sample of
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point

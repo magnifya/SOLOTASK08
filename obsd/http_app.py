@@ -34,6 +34,14 @@ def _labels(payload):
     if not isinstance(value, dict):
         raise ObsError("labels must be an object")
     return value
+def _group_by(value):
+    """``group_by`` arrives as a JSON array of label keys, or is absent."""
+    if value is None or value == "":
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        raise ObsError("group_by must be a JSON array of label keys")
 def dispatch(store, engine, method, path, params, payload):
     """Pure routing: (status, body) or ObsError. No sockets involved."""
     labels = {key[6:]: value for key, value in params.items() if key.startswith("label.")}
@@ -61,7 +69,8 @@ def dispatch(store, engine, method, path, params, payload):
                            start_ms=_int(params.get("start"), "start"),
                            end_ms=_int(params.get("end"), "end"),
                            step_ms=_int(params.get("step"), "step"),
-                           agg=params.get("agg") or None)
+                           agg=params.get("agg") or None,
+                           group_by=_group_by(params.get("group_by")))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
     if (method, path) == ("POST", "/v1/rules"):
@@ -94,7 +103,11 @@ def dispatch(store, engine, method, path, params, payload):
         return 200, engine.slo_status(_require(params, "name"), now, tenant=params.get("tenant"))
     raise ObsError("not found: %s %s" % (method, path))
 def _status_for(message):
-    if message.startswith(("not found", "unknown")):
+    if message.startswith("not found"):
+        return 404
+    # Unknown rules/alerts/SLOs/comparators are missing resources (404); an
+    # unknown aggregation is a malformed request (400).
+    if message.startswith("unknown") and not message.startswith("unknown aggregation"):
         return 404
     return 409 if message.startswith(("conflict", "quota exceeded")) else 400
 def make_handler(store, engine):
