@@ -78,6 +78,22 @@ def matches_labels(series_labels, matcher):
     return all(str(series_labels.get(key)) == str(value) for key, value in matcher.items())
 
 
+def _clean_group_by(group_by):
+    """Normalise ``group_by`` to a list of distinct non-empty label keys."""
+    if group_by is None:
+        return None
+    if not isinstance(group_by, (list, tuple)):
+        raise ObsError("group_by must be a list of label keys")
+    keys = []
+    for key in group_by:
+        if not isinstance(key, str) or not key:
+            raise ObsError("group_by keys must be non-empty strings")
+        keys.append(key)
+    if len(set(keys)) != len(keys):
+        raise ObsError("group_by keys must not repeat")
+    return keys
+
+
 def _aggregate(values, agg):
     if agg == "sum":
         return float(sum(values))
@@ -377,22 +393,36 @@ class SeriesStore:
         return out
 
     def query(self, tenant, metric, labels=None, start_ms=None, end_ms=None,
-              step_ms=None, agg=None):
+              step_ms=None, agg=None, group_by=None):
         """Raw or bucketed points per matching series.
 
         ``step_ms`` buckets are left-closed/right-open on epoch multiples and
         empty buckets are emitted as ``None``. A series with no sample in range
         is still listed, with an empty ``points`` list, unless ``agg`` is used
         without ``step_ms`` (then it yields nothing and is omitted).
+
+        ``group_by`` switches to cross-series grouping: ``None`` keeps the
+        per-series behaviour, ``[]`` merges every matching series into one
+        group, and a non-empty list of label keys groups series by those keys'
+        values (a missing key is simply absent from the group's labels, which
+        differs from a present-but-empty value). Grouping requires ``agg`` and
+        aggregates the raw samples of all series in a group together; results
+        carry only ``labels`` and ``points``.
         """
         if agg is not None and agg not in AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
         if step_ms is not None and (not _num(step_ms) or int(step_ms) <= 0):
             raise ObsError("step_ms must be a positive number")
+        group_by = _clean_group_by(group_by)
+        if group_by is not None and agg is None:
+            raise ObsError("group_by requires agg")
         lo = None if start_ms is None else int(start_ms)
         hi = None if end_ms is None else int(end_ms)
         if lo is not None and hi is not None and hi < lo:
             raise ObsError("end_ms must be >= start_ms")
+        if group_by is not None:
+            return self._query_grouped(tenant, metric, labels, lo, hi,
+                                       step_ms, agg, group_by)
         out = []
         for sid, samples in self._samples_for(tenant, metric, labels):
             rows = [item for item in samples
@@ -403,6 +433,30 @@ class SeriesStore:
             out.append({"series_id": sid, "labels": dict(self._series[sid]["labels"]),
                         "points": points})
         return out
+
+    def _query_grouped(self, tenant, metric, labels, lo, hi, step_ms, agg, group_by):
+        """Aggregate matching series into label groups under one snapshot."""
+        with self._lock:
+            matched = [(dict(row["labels"]), list(self._samples[sid]))
+                       for sid, row in sorted(self._series.items())
+                       if row["tenant"] == tenant and row["metric"] == metric
+                       and matches_labels(dict(row["labels"]), labels)]
+            groups = {}
+            for series_labels, samples in matched:
+                glabels = ({key: series_labels[key] for key in sorted(group_by)
+                            if key in series_labels} if group_by else {})
+                key = tuple(sorted(glabels.items()))
+                entry = groups.setdefault(key, {"labels": glabels, "samples": []})
+                entry["samples"].extend(
+                    item for item in samples
+                    if (lo is None or item[0] >= lo) and (hi is None or item[0] <= hi))
+            out = []
+            for key in sorted(groups):
+                entry = groups[key]
+                points = self._bucket(sorted(entry["samples"]), step_ms, agg, lo, hi)
+                out.append({"labels": entry["labels"],
+                            "points": [] if points is None else points})
+            return out
 
     def _bucket(self, rows, step_ms, agg, lo, hi):
         """``None`` = nothing to report, ``[]`` = known empty, else the points."""

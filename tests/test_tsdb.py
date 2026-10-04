@@ -116,6 +116,91 @@ class TestQuery(StoreCase):
         self.assertEqual(sorted(by_labels), ["a", "b"])
         self.assertEqual(by_labels["a"], [[0, 4.0], [10000, 5.0]])
         self.assertEqual(by_labels["b"], [[0, 3.0]])
+class TestGroupBy(StoreCase):
+    def seed(self, store):
+        store.write("acme", "m", {"zone": "a"}, [[0, 1.0], [1000, 3.0]])
+        store.write("acme", "m", {"zone": "a", "host": "h1"}, [[0, 9.0]])
+        store.write("acme", "m", {"zone": "b"}, [[0, 5.0], [5000, 7.0]])
+        store.write("acme", "m", {"host": "h2"}, [[0, 100.0]])
+        store.write("acme", "m", {"zone": ""}, [[0, 50.0]])
+    def test_omitted_group_by_keeps_per_series_behaviour(self):
+        store = self.store()
+        self.seed(store)
+        rows = store.query("acme", "m", start_ms=0, end_ms=10000)
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all("series_id" in row for row in rows))
+    def test_empty_group_by_merges_all_series(self):
+        store = self.store()
+        self.seed(store)
+        rows = store.query("acme", "m", start_ms=0, end_ms=10000, agg="count", group_by=[])
+        self.assertEqual(rows, [{"labels": {}, "points": [[0, 7]]}])
+    def test_group_aggregates_raw_samples_not_series_means(self):
+        store = self.store()
+        self.seed(store)
+        # zone=a: samples 1, 3, 9 across two series -> avg 13/3, not (2+9)/2.
+        rows = store.query("acme", "m", labels={"zone": "a"},
+                           start_ms=0, end_ms=10000, agg="avg", group_by=[])
+        self.assertEqual(rows, [{"labels": {}, "points": [[0, 13.0 / 3.0]]}])
+    def test_missing_label_and_empty_value_are_distinct_groups(self):
+        store = self.store()
+        self.seed(store)
+        rows = store.query("acme", "m", start_ms=0, end_ms=10000, agg="sum",
+                           group_by=["zone"])
+        self.assertEqual(rows, [
+            {"labels": {}, "points": [[0, 100.0]]},
+            {"labels": {"zone": ""}, "points": [[0, 50.0]]},
+            {"labels": {"zone": "a"}, "points": [[0, 13.0]]},
+            {"labels": {"zone": "b"}, "points": [[0, 12.0]]}])
+    def test_grouped_step_buckets_with_null_gaps(self):
+        store = self.store()
+        self.seed(store)
+        rows = store.query("acme", "m", labels={"zone": "b"}, start_ms=0, end_ms=10000,
+                           step_ms=1000, agg="sum", group_by=["zone"])
+        self.assertEqual(rows, [{"labels": {"zone": "b"}, "points": [
+            [0, 5.0], [1000, None], [2000, None], [3000, None], [4000, None],
+            [5000, 7.0]]}])
+    def test_matched_group_without_in_range_samples_is_empty_not_dropped(self):
+        store = self.store()
+        self.seed(store)
+        rows = store.query("acme", "m", start_ms=20000, end_ms=30000, agg="sum",
+                           group_by=["zone"])
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["points"] == [] for row in rows))
+    def test_no_matching_series_returns_empty_list(self):
+        store = self.store()
+        self.seed(store)
+        self.assertEqual(store.query("acme", "other", agg="sum", group_by=[]), [])
+        self.assertEqual(store.query("acme", "m", labels={"zone": "zz"},
+                                     agg="sum", group_by=[]), [])
+    def test_group_by_key_order_is_irrelevant(self):
+        store = self.store()
+        self.seed(store)
+        one = store.query("acme", "m", agg="sum", group_by=["zone", "host"])
+        two = store.query("acme", "m", agg="sum", group_by=["host", "zone"])
+        self.assertEqual(one, two)
+    def test_group_by_requires_agg_and_valid_keys(self):
+        store = self.store()
+        self.seed(store)
+        with self.assertRaises(ObsError):
+            store.query("acme", "m", group_by=["zone"])
+        with self.assertRaises(ObsError):
+            store.query("acme", "m", agg="median", group_by=["zone"])
+        for bad in ("zone", 5, {"k": 1}, True, [""], ["zone", "zone"], [None], [1]):
+            with self.assertRaises(ObsError, msg=repr(bad)):
+                store.query("acme", "m", agg="sum", group_by=bad)
+    def test_grouped_query_does_not_mutate_store(self):
+        store = self.store()
+        self.seed(store)
+        before = store.stats()
+        store.query("acme", "m", agg="sum", group_by=["zone"])
+        self.assertEqual(store.stats(), before)
+    def test_grouped_results_survive_reopen(self):
+        first = self.store("restart")
+        self.seed(first)
+        expected = first.query("acme", "m", agg="sum", group_by=["zone"])
+        second = self.store("restart")
+        self.assertEqual(second.query("acme", "m", agg="sum", group_by=["zone"]),
+                         expected)
 class TestRetentionAndPersistence(StoreCase):
     def test_enforce_retention_drops_old_points(self):
         store = self.store()

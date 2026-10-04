@@ -34,6 +34,14 @@ def _labels(payload):
     if not isinstance(value, dict):
         raise ObsError("labels must be an object")
     return value
+def _group_by(text):
+    """Parse the ``group_by`` query parameter: JSON array text or absent."""
+    if text is None or text == "":
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise ObsError("group_by must be a JSON array of label keys")
 def dispatch(store, engine, method, path, params, payload):
     """Pure routing: (status, body) or ObsError. No sockets involved."""
     labels = {key[6:]: value for key, value in params.items() if key.startswith("label.")}
@@ -61,7 +69,8 @@ def dispatch(store, engine, method, path, params, payload):
                            start_ms=_int(params.get("start"), "start"),
                            end_ms=_int(params.get("end"), "end"),
                            step_ms=_int(params.get("step"), "step"),
-                           agg=params.get("agg") or None)
+                           agg=params.get("agg") or None,
+                           group_by=_group_by(params.get("group_by")))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
     if (method, path) == ("POST", "/v1/rules"):
