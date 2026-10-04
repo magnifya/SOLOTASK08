@@ -79,6 +79,8 @@ def _build_parser():
     query.add_argument("--start", type=int, default=None)
     query.add_argument("--end", type=int, default=None)
     query.add_argument("--step", type=int, default=None)
+    query.add_argument("--window-ms", type=int, default=None,
+                       help="sliding-window length in ms; requires --start/--end/--step/--agg")
     query.add_argument("--agg", choices=AGGS, default=None)
     query.add_argument("--group-by", default=None, metavar="JSON_ARRAY",
                        help="JSON array of label keys for cross-series grouping "
@@ -140,7 +142,7 @@ def _run(args, store, engine):
                 raise ObsError("--group-by must be a JSON array of label keys")
         rows = store.query(args.tenant, args.metric, labels=_labels(args.label),
                            start_ms=args.start, end_ms=args.end, step_ms=args.step,
-                           agg=args.agg, group_by=group_by)
+                           agg=args.agg, group_by=group_by, window_ms=args.window_ms)
         _emit({"series": [{"labels": row["labels"], "points": row["points"]} for row in rows]})
     elif args.command == "rule-add":
         _emit(engine.add_rule({

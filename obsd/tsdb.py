@@ -353,12 +353,22 @@ class SeriesStore:
         return {"series_id": sid, "written": written, "duplicates": duplicates}
 
     # ------------------------------------------------------------------- query
-    def _samples_for(self, tenant, metric, labels):
+    def _matching_series(self, tenant, metric, labels):
+        """Snapshot of every matching series: sid, labels and raw samples.
+
+        Copied under one lock acquisition so a query can never mix samples from
+        before and after a concurrent write or retention sweep.
+        """
         with self._lock:
             ids = sorted(sid for sid, row in self._series.items()
                          if row["tenant"] == tenant and row["metric"] == metric
                          and matches_labels(dict(row["labels"]), labels))
-            return [(sid, list(self._samples[sid])) for sid in ids]
+            return [(sid, dict(self._series[sid]["labels"]), list(self._samples[sid]))
+                    for sid in ids]
+
+    def _samples_for(self, tenant, metric, labels):
+        return [(sid, samples) for sid, _, samples in
+                self._matching_series(tenant, metric, labels)]
 
     def _scan(self, tenant, metric, labels, start_ms, end_ms):
         """Raw samples of matching series inside ``[start, end]`` (internal).
@@ -377,8 +387,8 @@ class SeriesStore:
         return out
 
     def query(self, tenant, metric, labels=None, start_ms=None, end_ms=None,
-              step_ms=None, agg=None, group_by=None):
-        """Raw or bucketed points per matching series.
+              step_ms=None, agg=None, group_by=None, window_ms=None):
+        """Raw, bucketed or sliding-window points per matching series.
 
         ``step_ms`` buckets are left-closed/right-open on epoch multiples and
         empty buckets are emitted as ``None``. A series with no sample in range
@@ -391,9 +401,25 @@ class SeriesStore:
         all series in a group are aggregated together and each result row
         carries only ``labels`` (the group keys present on those series) and
         ``points``.
+
+        With ``window_ms`` the query switches to sliding-window mode: it
+        requires ``start_ms``, ``end_ms``, ``step_ms`` and ``agg``, all integer
+        milliseconds (step and window strictly positive). Evaluation times are
+        ``start_ms + k*step_ms`` not exceeding ``end_ms``; the point timestamp
+        is the evaluation time and its value aggregates the raw samples in
+        ``(t - window_ms, t]`` (left edge excluded, right edge included). The
+        first window reads history before ``start_ms``, but never anything past
+        ``t``. Empty windows, including ``count``, emit ``None``. Every matching
+        series (or group) gets the full time grid even when every window is
+        empty; no matching series yields an empty list.
         """
         if agg is not None and agg not in AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
+        if window_ms is not None:
+            lo, hi, step, window = self._window_params(
+                start_ms, end_ms, step_ms, window_ms, agg)
+            return self._query_windows(tenant, metric, labels, lo, hi, step,
+                                       agg, group_by, window)
         if step_ms is not None and (not _num(step_ms) or int(step_ms) <= 0):
             raise ObsError("step_ms must be a positive number")
         lo = None if start_ms is None else int(start_ms)
@@ -412,6 +438,87 @@ class SeriesStore:
                 continue
             out.append({"series_id": sid, "labels": dict(self._series[sid]["labels"]),
                         "points": points})
+        return out
+
+    @staticmethod
+    def _window_params(start_ms, end_ms, step_ms, window_ms, agg):
+        """Validate sliding-window arguments; return ``(start, end, step, window)``."""
+        if not isinstance(window_ms, int) or isinstance(window_ms, bool) or window_ms <= 0:
+            raise ObsError("window_ms must be a positive integer")
+        if not isinstance(start_ms, int) or isinstance(start_ms, bool):
+            raise ObsError("sliding-window query requires an integer start_ms")
+        if not isinstance(end_ms, int) or isinstance(end_ms, bool):
+            raise ObsError("sliding-window query requires an integer end_ms")
+        if not isinstance(step_ms, int) or isinstance(step_ms, bool) or step_ms <= 0:
+            raise ObsError("sliding-window query requires a positive integer step_ms")
+        if end_ms < start_ms:
+            raise ObsError("end_ms must be >= start_ms")
+        if agg is None:
+            raise ObsError("sliding-window query requires agg")
+        return start_ms, end_ms, step_ms, window_ms
+
+    def _window_grid(self, start_ms, end_ms, step_ms):
+        """The ``start_ms + k*step_ms`` evaluation times not past ``end_ms``."""
+        return range(start_ms, end_ms + 1, step_ms)
+
+    def _window_values(self, rows, window, times, agg):
+        """Aggregate the samples of ``(t - window, t]`` for each ``t``.
+
+        ``rows`` is a timestamp-sorted sample list shared by every time. A
+        sample at the evaluation time is included; one exactly one window
+        length earlier is excluded. Empty windows (no samples, regardless of
+        the aggregation, even ``count``) become ``None``.
+        """
+        points = []
+        index = 0
+        for t in times:
+            left = t - window
+            while index < len(rows) and rows[index][0] <= left:
+                index += 1
+            values = []
+            for cursor in range(index, len(rows)):
+                stamp = rows[cursor][0]
+                if stamp > t:
+                    break
+                values.append(rows[cursor][1])
+            points.append([t, None if not values else _aggregate(values, agg)])
+        return points
+
+    def _query_windows(self, tenant, metric, labels, lo, hi, step_ms, agg,
+                       group_by, window):
+        if group_by is not None:
+            if not isinstance(group_by, (list, tuple)):
+                raise ObsError("group_by must be a list of label keys")
+            keys = list(group_by)
+            for key in keys:
+                if not isinstance(key, str) or not key:
+                    raise ObsError("group_by entries must be non-empty strings")
+            if len(set(keys)) != len(keys):
+                raise ObsError("group_by entries must not contain duplicates")
+        times = list(self._window_grid(lo, hi, step_ms))
+        matched = self._matching_series(tenant, metric, labels)
+        if group_by is None:
+            out = []
+            for sid, series_labels, samples in matched:
+                points = self._window_values(samples, window, times, agg)
+                out.append({"series_id": sid, "labels": dict(series_labels),
+                            "points": points})
+            return out
+        groups = {}
+        for sid, series_labels, samples in matched:
+            group_labels = {key: series_labels[key] for key in keys
+                            if key in series_labels}
+            token = tuple(sorted(group_labels.items()))
+            entry = groups.setdefault(token, {"labels": group_labels, "rows": []})
+            # The first window reads history before start_ms; no window reads
+            # anything past its own evaluation time, so no upper filter applies.
+            entry["rows"].extend(samples)
+        out = []
+        for token in sorted(groups):
+            entry = groups[token]
+            rows = sorted(entry["rows"])
+            out.append({"labels": entry["labels"],
+                        "points": self._window_values(rows, window, times, agg)})
         return out
 
     def _bucket(self, rows, step_ms, agg, lo, hi):

@@ -39,6 +39,7 @@ stderr and exits non-zero.
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
+| `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
@@ -55,7 +56,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=` (group_by is a JSON array of label keys) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=` (group_by is a JSON array of label keys) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -141,6 +142,42 @@ range is still listed with empty `points`; no matching series at all yields an
 empty `series` array. `group_by` must be a list of distinct non-empty strings
 and requires `agg`; violations raise `ObsError` (`400` over HTTP, one JSON
 error line on stderr for the CLI).
+
+**Sliding-window query.** `query(..., start_ms=start, end_ms=end, step_ms=step,
+agg=agg, window_ms=window)` switches to a separate mode the moment `window_ms`
+is supplied (it is optional in every binding: `window` on `GET /v1/query`,
+`--window-ms` on the CLI). In this mode `start_ms`, `end_ms`, `step_ms` and
+`agg` are all required; `start_ms` and `end_ms` must be integer milliseconds,
+`step_ms` and `window_ms` positive integer milliseconds, and `end_ms >=
+start_ms` (bools, fractions and missing/unknown values are rejected). Evaluation
+times are `t = start + k*step` for `k = 0, 1, ...`, keeping only times
+`t <= end`; the output point timestamp is the evaluation time itself. The step
+need not divide the window and windows are never aligned to fixed buckets.
+
+Each evaluation aggregates the raw samples in the half-open interval
+`(t - window_ms, t]`: the left edge is excluded (a sample exactly one window
+length earlier does not count), the right edge included (a sample at `t`
+does). `start_ms` only constrains the output grid — the first window at
+`start` also reads history older than `start`; no window ever reads a sample
+newer than its own evaluation time. The aggregation uses the same meanings as
+bucketing (`sum`, `avg`, `min`, `max`, `count`), and a window containing no
+sample emits `[t, null]` for *every* aggregation, including `count`.
+
+Every matching registered series is returned on the full time grid even when
+all of its windows are empty; no matching series yields an empty `series`
+array. The Python per-series rows keep `series_id`; HTTP and CLI keep the
+existing result shape. With `group_by`, all raw samples of the group's series
+that fall in each window are pooled before aggregating (samples sharing a
+timestamp across series count individually, `avg` divides by the total sample
+count), a missing group key and an empty-string value stay distinct groups,
+and each group keeps the full grid, fully null when no sample ever falls in a
+window. Group filtering, ordering and validation follow the ordinary grouped
+rules. The whole query reads one coherent snapshot, so concurrent writes or
+retention sweeps can never mix old and new data; queries never alter samples,
+counters or configuration, and the same history gives identical results after
+reopening the store. Omitting `window_ms` preserves the previous query
+behaviour exactly — `rollup`, write idempotency/overwrite, quotas, alerts and
+SLOs are unaffected.
 
 **Retention.** `enforce_retention(tenant, cutoff_ms)` removes every sample of
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point
@@ -280,7 +317,11 @@ python3 -m unittest discover -s tests -v
 
 Covered: series identity and label-order independence, idempotent re-write,
 conflicting-timestamp rejection and `overwrite`, range filtering, epoch-aligned
-buckets, null buckets, all five aggregations, deterministic rollups, retention,
+buckets, null buckets, all five aggregations, deterministic rollups,
+sliding-window grids with left-open/right-closed windows, null empty windows
+(including count), full grids for empty series and groups, window argument
+validation across Python/HTTP/CLI, window snapshot consistency under
+concurrent writes and retention, retention,
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label
