@@ -1,8 +1,9 @@
-"""Tests for obsd.tsdb: identity, idempotency, query, aggregation, retention."""
+"""Tests for obsd.tsdb: identity, idempotency, query, aggregation, retention, quotas."""
 
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
 from obsd import ObsError, SeriesStore
@@ -133,5 +134,176 @@ class TestRetentionAndPersistence(StoreCase):
         self.assertEqual(second.stats()["series"], 1)
         self.assertEqual(second.query("acme", "m")[0]["points"], [[1000, 1.0], [2000, 2.0]])
         self.assertEqual(second.write("acme", "m", {"k": "v"}, [[1000, 1.0]])["duplicates"], 1)
+
+
+class TestQuotas(StoreCase):
+    def test_unconfigured_tenant_is_unlimited_with_zero_usage(self):
+        store = self.store()
+        self.assertEqual(store.quota_status("acme"),
+                         {"tenant": "acme", "max_series": None, "max_points": None,
+                          "series": 0, "points": 0})
+
+    def test_set_quota_does_not_create_series_and_persists(self):
+        first = self.store("q")
+        first.set_quota("acme", 2, 3)
+        self.assertEqual(first.stats()["series"], 0)
+        self.assertTrue(os.path.exists(os.path.join(first.root, "quotas.json")))
+        second = self.store("q")
+        self.assertEqual(second.quota_status("acme"),
+                         {"tenant": "acme", "max_series": 2, "max_points": 3,
+                          "series": 0, "points": 0})
+
+    def test_invalid_tenant_and_limits_raise_and_leave_config_untouched(self):
+        store = self.store()
+        store.set_quota("acme", 2, 3)
+        for bad_tenant in ("", None, 5, b"acme"):
+            with self.assertRaises(ObsError, msg=repr(bad_tenant)):
+                store.set_quota(bad_tenant, 1, 1)
+        for bad_limit in (True, False, "1", 1.5, -1, [], {}):
+            with self.assertRaises(ObsError, msg=repr(bad_limit)):
+                store.set_quota("acme", bad_limit, None)
+            with self.assertRaises(ObsError, msg=repr(bad_limit)):
+                store.set_quota("acme", None, bad_limit)
+        with self.assertRaises(ObsError):
+            store.quota_status("")
+        self.assertEqual(store.quota_status("acme")["max_series"], 2)
+        self.assertEqual(store.quota_status("acme")["max_points"], 3)
+
+    def test_zero_forbids_new_series_and_points(self):
+        store = self.store()
+        store.set_quota("acme", 0, 0)
+        with self.assertRaises(ObsError):
+            store.write("acme", "m", {}, [[1000, 1.0]])
+        self.assertEqual(store.stats()["series"], 0)
+        self.assertEqual(store.stats()["writes"], 0)
+
+    def test_in_batch_duplicate_timestamp_counts_once(self):
+        store = self.store()
+        store.set_quota("acme", None, 2)
+        result = store.write("acme", "m", {}, [[1000, 1.0], [1000, 1.0], [2000, 2.0]])
+        self.assertEqual((result["written"], result["duplicates"]), (2, 1))
+        self.assertEqual(store.quota_status("acme")["points"], 2)
+        with self.assertRaises(ObsError):
+            store.write("acme", "m", {}, [[3000, 3.0]])
+
+    def test_replay_and_label_order_do_not_increase_usage(self):
+        store = self.store()
+        store.set_quota("acme", 1, 2)
+        store.write("acme", "m", {"a": "1", "b": "2"}, [[1000, 1.0], [2000, 2.0]])
+        again = store.write("acme", "m", [["b", "2"], ["a", "1"]], [[1000, 1.0], [2000, 2.0]])
+        self.assertEqual((again["written"], again["duplicates"]), (0, 2))
+        self.assertEqual(store.quota_status("acme"),
+                         {"tenant": "acme", "max_series": 1, "max_points": 2,
+                          "series": 1, "points": 2})
+
+    def test_quota_enforced_by_whole_batch_net_increase(self):
+        store = self.store()
+        store.set_quota("acme", 5, 2)
+        store.write("acme", "m", {}, [[1000, 1.0], [2000, 2.0]])
+        # One batch adds a new series (series 1+1=2 <= 5) AND a new point
+        # (points 2+1=3 > 2): the exceeded points dimension rejects the whole
+        # batch, so the new series must not remain either.
+        with self.assertRaises(ObsError):
+            store.write("acme", "m2", {}, [[1000, 9.0]])
+        self.assertEqual(store.stats()["series"], 1)
+        self.assertEqual(store.quota_status("acme")["points"], 2)
+        self.assertEqual(store.stats()["writes"], 1)
+
+    def test_rejected_batch_leaves_nothing_and_writes_counter_unchanged(self):
+        store = self.store()
+        store.set_quota("acme", 1, 2)
+        store.write("acme", "m", {}, [[1000, 1.0], [2000, 2.0]])
+        with self.assertRaises(ObsError):
+            store.write("acme", "m2", {}, [[1000, 1.0]])
+        self.assertEqual(store.stats()["series"], 1)
+        self.assertEqual(store.stats()["writes"], 1)
+        with self.assertRaises(ObsError):
+            store.write("acme", "m", {}, [[2000, 9.0], [3000, 3.0]])  # conflict first
+        self.assertEqual(store.stats()["writes"], 1)
+
+    def test_boundary_value_is_allowed(self):
+        store = self.store()
+        store.set_quota("acme", 1, 2)
+        store.write("acme", "m", {}, [[1000, 1.0]])
+        result = store.write("acme", "m", {}, [[2000, 2.0]])  # points reach exactly 2
+        self.assertEqual(result["written"], 1)
+        self.assertEqual(store.quota_status("acme")["points"], 2)
+
+    def test_lowering_limit_below_usage_still_allows_replay_and_overwrite(self):
+        store = self.store()
+        store.write("acme", "m", {}, [[1000, 1.0], [2000, 2.0]])
+        store.set_quota("acme", 0, 0)
+        replay = store.write("acme", "m", {}, [[1000, 1.0]])
+        self.assertEqual((replay["written"], replay["duplicates"]), (0, 1))
+        overwritten = store.write("acme", "m", {}, [[1000, 9.0]], overwrite=True)
+        self.assertEqual(overwritten["written"], 1)
+        self.assertEqual(store.quota_status("acme")["points"], 2)
+        # Only the dimension that grows is checked: adding a point is blocked.
+        with self.assertRaises(ObsError):
+            store.write("acme", "m", {}, [[3000, 3.0]])
+
+    def test_other_tenants_are_isolated(self):
+        store = self.store()
+        store.set_quota("acme", 0, 0)
+        store.write("globex", "m", {}, [[1000, 1.0], [2000, 2.0]])
+        self.assertEqual(store.quota_status("globex"),
+                         {"tenant": "globex", "max_series": None, "max_points": None,
+                          "series": 1, "points": 2})
+        with self.assertRaises(ObsError):
+            store.write("acme", "m", {}, [[1000, 1.0]])
+
+    def test_retention_frees_points_but_keeps_series_usage(self):
+        store = self.store()
+        store.set_quota("acme", 1, 5)
+        store.write("acme", "m", {}, [[1000, 1.0], [2000, 2.0], [3000, 3.0]])
+        store.enforce_retention("acme", 2500)
+        self.assertEqual(store.quota_status("acme"),
+                         {"tenant": "acme", "max_series": 1, "max_points": 5,
+                          "series": 1, "points": 1})
+        store.enforce_retention("acme", 100000)
+        status = store.quota_status("acme")
+        self.assertEqual((status["series"], status["points"]), (1, 0))
+
+    def test_restart_usage_consistent_and_overwrites_not_double_counted(self):
+        first = self.store("restart-q")
+        first.set_quota("acme", 2, 5)
+        first.write("acme", "m", {}, [[1000, 1.0], [2000, 2.0]])
+        first.write("acme", "m", {}, [[1000, 9.0], [2000, 8.0]], overwrite=True)
+        second = self.store("restart-q")
+        self.assertEqual(second.quota_status("acme"),
+                         {"tenant": "acme", "max_series": 2, "max_points": 5,
+                          "series": 1, "points": 2})
+        self.assertEqual(second.query("acme", "m")[0]["points"], [[1000, 9.0], [2000, 8.0]])
+
+    def test_old_directory_without_quota_file_is_unlimited(self):
+        path = os.path.join(self.tmp, "old")
+        first = SeriesStore(path)
+        first.write("acme", "m", {}, [[1000, 1.0]])
+        self.assertFalse(os.path.exists(os.path.join(path, "quotas.json")))
+        reopened = SeriesStore(path)
+        self.assertIsNone(reopened.quota_status("acme")["max_points"])
+
+    def test_concurrent_writes_never_exceed_quota(self):
+        store = self.store()
+        store.set_quota("acme", 100, 100)
+        errors = []
+
+        def worker(start):
+            try:
+                store.write("acme", "m%d" % start, {}, [[1000, 1.0]])
+            except ObsError as exc:
+                errors.append(str(exc))
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(200)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        status = store.quota_status("acme")
+        self.assertEqual(status["series"], 100)
+        self.assertEqual(status["points"], 100)
+        self.assertEqual(len(errors), 100)
+
+
 if __name__ == "__main__":
     unittest.main()

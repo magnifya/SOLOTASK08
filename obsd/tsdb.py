@@ -115,6 +115,7 @@ class SeriesStore:
 
         <root>/series.json                 registry: series_id -> series row
         <root>/points/<series_id>.jsonl    one ``{"t":ts,"v":value}`` per line
+        <root>/quotas.json                 per-tenant max_series/max_points
     """
 
     def __init__(self, root):
@@ -123,10 +124,13 @@ class SeriesStore:
         self.root = os.path.abspath(str(root))
         self.points_dir = os.path.join(self.root, "points")
         self.series_path = os.path.join(self.root, "series.json")
+        self.quotas_path = os.path.join(self.root, "quotas.json")
         self._lock = threading.RLock()
         self._series, self._samples, self._writes = {}, {}, 0
+        self._quotas = {}
         os.makedirs(self.points_dir, exist_ok=True)
         self._load()
+        self._load_quotas()
 
     def _points_path(self, sid):
         return os.path.join(self.points_dir, sid + ".jsonl")
@@ -151,18 +155,22 @@ class SeriesStore:
             self._samples[sid] = self._read_points(sid)
 
     def _read_points(self, sid):
-        """Reload one point file, skipping unreadable lines."""
-        rows = []
+        """Reload one point file; the last line for a timestamp wins.
+
+        Overwrites append a fresh line, so repeated writes of the same
+        timestamp collapse to one occupied point on reload.
+        """
+        by_stamp = {}
         path = self._points_path(sid)
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     try:
                         row = json.loads(line)
-                        rows.append((int(row["t"]), float(row["v"])))
+                        by_stamp[int(row["t"])] = float(row["v"])
                     except (ValueError, KeyError, TypeError):
                         continue
-        return sorted(rows)
+        return sorted(by_stamp.items())
 
     def _save_registry(self):
         _atomic_write(self.series_path, json.dumps(
@@ -173,23 +181,95 @@ class SeriesStore:
         _atomic_write(self._points_path(sid),
                       "".join(_line(ts, value) for ts, value in self._samples[sid]))
 
-    # ------------------------------------------------------------------- write
-    def _ensure_series(self, tenant, metric, labels):
-        pairs = _labels_list(labels)
-        identity = canonical_identity(tenant, metric, pairs)
-        sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        if sid not in self._series:
-            self._series[sid] = {"series_id": sid, "tenant": tenant, "metric": metric,
-                                 "labels": pairs, "identity": identity}
-            self._samples[sid] = []
-        return sid
+    # ------------------------------------------------------------------ quotas
+    def _load_quotas(self):
+        """Reload per-tenant limits; a directory without a quota file has none."""
+        if not os.path.exists(self.quotas_path):
+            return
+        try:
+            with open(self.quotas_path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ObsError("cannot read quota config: %s" % exc)
+        if not isinstance(raw, dict):
+            raise ObsError("quota config must be an object of tenants")
+        for tenant, limits in raw.items():
+            if not isinstance(tenant, str) or not tenant or not isinstance(limits, dict):
+                raise ObsError("quota config entries must map a non-empty tenant to limits")
+            max_series = limits.get("max_series")
+            max_points = limits.get("max_points")
+            self._quotas[tenant] = {
+                "max_series": None if max_series is None else self._valid_limit(max_series, "max_series"),
+                "max_points": None if max_points is None else self._valid_limit(max_points, "max_points")}
 
+    @staticmethod
+    def _valid_limit(value, field):
+        """A limit is a non-negative int (never bool/float/str) or None."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ObsError("%s must be a non-negative integer or null" % field)
+        if value < 0:
+            raise ObsError("%s must be a non-negative integer or null" % field)
+        return value
+
+    @staticmethod
+    def _valid_tenant(tenant):
+        if not isinstance(tenant, str) or not tenant:
+            raise ObsError("tenant must be a non-empty string")
+        return tenant
+
+    def _save_quotas(self):
+        _atomic_write(self.quotas_path, json.dumps(
+            {tenant: self._quotas[tenant] for tenant in sorted(self._quotas)},
+            sort_keys=True, separators=(",", ":")))
+
+    def set_quota(self, tenant, max_series, max_points):
+        """Configure a tenant's limits atomically; None means unlimited.
+
+        Validation happens before any state change, so a bad request never
+        alters the stored configuration. Setting a quota never creates a
+        series.
+        """
+        self._valid_tenant(tenant)
+        max_series = self._valid_limit(max_series, "max_series")
+        max_points = self._valid_limit(max_points, "max_points")
+        with self._lock:
+            self._quotas[tenant] = {"max_series": max_series, "max_points": max_points}
+            self._save_quotas()
+            return self.quota_status(tenant)
+
+    def _tenant_usage(self, tenant):
+        series_count = points_count = 0
+        for sid, row in self._series.items():
+            if row["tenant"] == tenant:
+                series_count += 1
+                points_count += len(self._samples[sid])
+        return series_count, points_count
+
+    def quota_status(self, tenant):
+        """Limits (None when unconfigured) and current usage for one tenant."""
+        self._valid_tenant(tenant)
+        with self._lock:
+            limits = self._quotas.get(tenant, {"max_series": None, "max_points": None})
+            series_count, points_count = self._tenant_usage(tenant)
+            return {"tenant": tenant, "max_series": limits["max_series"],
+                    "max_points": limits["max_points"],
+                    "series": series_count, "points": points_count}
+
+    # ------------------------------------------------------------------- write
     def write(self, tenant, metric, labels, samples, now=None, overwrite=False):
         """Store ``samples`` = ``[(timestamp_ms, value), ...]``.
 
         Idempotent: an identical ``(series, timestamp)`` value is a duplicate
         and changes nothing. A differing value for a stored timestamp raises
         ``ObsError`` unless ``overwrite=True``.
+
+        Existing input validation and conflict rules run first; the batch is
+        then checked against the tenant's quota by its net increase in distinct
+        series/timestamps. Any exceeded dimension rejects the whole batch with
+        ``ObsError`` (HTTP 409): no new series, sample or write counter change
+        remains.
         """
         if not isinstance(samples, (list, tuple)):
             raise ObsError("samples must be a list of [timestamp_ms, value] pairs")
@@ -206,9 +286,13 @@ class SeriesStore:
             clean.append((int(stamp), float(value)))
         if not clean:
             raise ObsError("samples must not be empty")
+        pairs = _labels_list(labels)
+        identity = canonical_identity(tenant, metric, pairs)
+        sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         with self._lock:
-            sid = self._ensure_series(tenant, metric, labels)
-            merged = dict(self._samples[sid])
+            existed = sid in self._series
+            stored = dict(self._samples.get(sid, ()))
+            merged = dict(stored)
             written = duplicates = 0
             fresh = []
             for stamp, value in clean:
@@ -221,6 +305,27 @@ class SeriesStore:
                 merged[stamp] = value
                 fresh.append((stamp, value))
                 written += 1
+            # Net increase: a new series counts once, and only distinct
+            # timestamps not already stored occupy new points.
+            new_series = 0 if existed else 1
+            new_points = len({stamp for stamp, _ in clean} - set(stored))
+            limits = self._quotas.get(tenant)
+            if limits is not None:
+                cur_series, cur_points = self._tenant_usage(tenant)
+                if (new_series and limits["max_series"] is not None
+                        and cur_series + new_series > limits["max_series"]):
+                    raise ObsError(
+                        "conflict: tenant %r quota exceeded: series %d + %d > max_series %d"
+                        % (tenant, cur_series, new_series, limits["max_series"]))
+                if (new_points and limits["max_points"] is not None
+                        and cur_points + new_points > limits["max_points"]):
+                    raise ObsError(
+                        "conflict: tenant %r quota exceeded: points %d + %d > max_points %d"
+                        % (tenant, cur_points, new_points, limits["max_points"]))
+            if not existed:
+                self._series[sid] = {"series_id": sid, "tenant": tenant, "metric": metric,
+                                     "labels": pairs, "identity": identity}
+                self._samples[sid] = []
             if fresh:
                 self._samples[sid] = sorted(merged.items())
                 with open(self._points_path(sid), "a", encoding="utf-8") as handle:

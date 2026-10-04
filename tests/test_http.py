@@ -123,5 +123,85 @@ class TestHttpApi(HttpCase):
         self.assertAlmostEqual(status["error_budget"], 0.0)
         self.assertAlmostEqual(status["burn_rate"], 1.0)
         self.assertTrue(status["met"])
+
+
+class TestQuotasHttp(HttpCase):
+    def quota(self, tenant):
+        return self.request("GET", "/v1/quotas?tenant=%s" % tenant)
+
+    def set_quota(self, payload):
+        return self.request("POST", "/v1/quotas", payload)
+
+    def test_unconfigured_tenant_reports_null_limits_and_zero_usage(self):
+        code, body = self.quota("acme")
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"tenant": "acme", "max_series": None, "max_points": None,
+                                "series": 0, "points": 0})
+
+    def test_set_and_query_quota_returns_200_with_five_fields(self):
+        code, body = self.set_quota({"tenant": "acme", "max_series": 1, "max_points": 2})
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"tenant": "acme", "max_series": 1, "max_points": 2,
+                                "series": 0, "points": 0})
+        code, body = self.set_quota({"tenant": "globex", "max_points": 5})  # omitted field
+        self.assertEqual(code, 200)
+        self.assertIsNone(body["max_series"])
+        self.assertEqual(body["max_points"], 5)
+        code, body = self.quota("acme")
+        self.assertEqual(code, 200)
+        self.assertEqual((body["series"], body["points"]), (0, 0))
+
+    def test_invalid_quota_requests_are_400_and_do_not_change_config(self):
+        self.set_quota({"tenant": "acme", "max_series": 1, "max_points": 2})
+        for bad in (
+            {"max_series": 1, "max_points": 1},
+            {"tenant": "", "max_series": 1, "max_points": 1},
+            {"tenant": "acme", "max_series": True},
+            {"tenant": "acme", "max_points": "2"},
+            {"tenant": "acme", "max_series": 0.5},
+            {"tenant": "acme", "max_points": -1},
+        ):
+            code, body = self.set_quota(bad)
+            self.assertEqual(code, 400, bad)
+            self.assertIn("error", body)
+        code, body = self.request("GET", "/v1/quotas")
+        self.assertEqual(code, 400)
+        code, body = self.quota("acme")
+        self.assertEqual((body["max_series"], body["max_points"]), (1, 2))
+
+    def test_writes_are_limited_and_409_rejects_whole_batch(self):
+        self.set_quota({"tenant": "acme", "max_series": 1, "max_points": 2})
+        body = self.write({}, [[1000, 1.0], [1000, 1.0], [2000, 2.0]])
+        self.assertEqual((body["written"], body["duplicates"]), (2, 1))
+        code, body = self.quota("acme")
+        self.assertEqual((body["series"], body["points"]), (1, 2))
+        # New series rejected (series dimension), no partial series/points.
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "other", "labels": {}, "samples": [[1000, 1.0]]})
+        self.assertEqual(code, 409)
+        self.assertIn("quota", body["error"])
+        # New point rejected (points dimension).
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {}, "samples": [[3000, 3.0]]})
+        self.assertEqual(code, 409)
+        # Pure replay still succeeds while at the cap.
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {}, "samples": [[1000, 1.0]]})
+        self.assertEqual(code, 202)
+        self.assertEqual((body["written"], body["duplicates"]), (0, 1))
+        code, status = self.quota("acme")
+        self.assertEqual(status, {"tenant": "acme", "max_series": 1, "max_points": 2,
+                                  "series": 1, "points": 2})
+
+    def test_quota_does_not_touch_other_tenants(self):
+        self.set_quota({"tenant": "acme", "max_series": 0, "max_points": 0})
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "globex", "metric": "latency_ms", "labels": {},
+            "samples": [[1000, 1.0]]})
+        self.assertEqual(code, 202, body)
+        code, body = self.quota("globex")
+        self.assertEqual((body["series"], body["points"], body["max_points"]), (1, 1, None))
+
+
 if __name__ == "__main__":
     unittest.main()

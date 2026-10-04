@@ -51,8 +51,10 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
-| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp |
+| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or exceeded quota |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=` | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| POST | `/v1/quotas` | `{"tenant","max_series","max_points"}` (limits non-negative int or null; omitted field means unlimited) | `200 {"tenant","max_series","max_points","series","points"}`, `400` on bad tenant/limit |
+| GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (null limits for unconfigured tenants) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -81,6 +83,7 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 ```
 <data-dir>/series.json              registry: series_id -> tenant/metric/labels
 <data-dir>/points/<series_id>.jsonl one {"t":ts,"v":value} object per line
+<data-dir>/quotas.json              per-tenant max_series / max_points limits
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
@@ -100,6 +103,36 @@ and is counted in `duplicates`. A *different* value for a stored timestamp is a
 conflict: it raises `ObsError` (`409` over HTTP) unless `overwrite=True`, in
 which case the stored value is replaced and counted in `written`. A timestamp
 greater than the injected `now` (when `now` is given) is rejected.
+
+**Per-tenant write quotas.** `set_quota(tenant, max_series, max_points)` and
+`quota_status(tenant)` configure and inspect per-tenant limits. A limit is a
+non-negative integer (booleans, strings and floats are rejected) or `null`;
+`null` and an omitted field both mean unlimited, and `0` forbids any new
+series or point. The tenant must be a non-empty string. Invalid input raises
+`ObsError` (`400` over HTTP) and never changes the stored configuration;
+setting a quota never creates a series. Both quota endpoints return the same
+five-field object `{"tenant","max_series","max_points","series","points"}`
+with status `200`; an unconfigured tenant reports `null` limits together with
+its actual usage (zero when there is no data).
+
+Quotas aggregate all metrics of a tenant: `series` counts registered series
+and `points` counts the total number of distinct timestamps across the
+tenant's series (not physical record lines). Label order, same-value replays
+and overwriting an existing point do not increase usage, and a timestamp
+repeated inside one batch counts once. The Python `write`, `POST /v1/series`
+and the CLI `write` all enforce the quota: existing input validation and
+conflict rules run first, then the batch's *net* increase is checked. If
+either increased dimension would exceed its limit, `write` raises `ObsError`
+(`409` over HTTP; the CLI prints the JSON error and exits non-zero) and the
+whole batch is rejected — no new series, partial sample or write-counter
+change remains. A limit may be lowered below the current usage: pure replays
+and overwrites still succeed, and only the dimensions the current batch
+increases are checked (an already-exceeded dimension that does not grow does
+not block the write). Retention cleanup frees deleted points; emptying a
+series of points keeps its series usage. Limits and usage are persisted in
+`quotas.json` and are consistent after reopening a directory (repeated
+historical overwrites of the same timestamp are never double-counted); an old
+directory without a quota file is unlimited, and tenants are independent.
 
 **Bucketing.** `query(..., step_ms=step, agg=agg)` assigns a sample with
 timestamp `t` to bucket `b = t - (t % step)`, i.e. buckets are
@@ -232,8 +265,11 @@ buckets, null buckets, all five aggregations, deterministic rollups, retention,
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label
-set, SLO/error-budget/burn-rate math (including the empty window), and the live
-HTTP surface over a real socket.
+set, SLO/error-budget/burn-rate math (including the empty window), per-tenant
+quota configuration, validation and enforcement (batch net increase, whole-batch
+rejection, zero/over-quota replays and overwrites, retention freeing points,
+restart consistency, tenant isolation and concurrency), and the live HTTP
+surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the
 modules never read the wall clock inside decision logic.

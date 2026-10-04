@@ -48,6 +48,12 @@ def dispatch(store, engine, method, path, params, payload):
                              overwrite=bool(payload.get("overwrite", False)))
         return 202, {"written": result["written"], "duplicates": result["duplicates"],
                      "series_id": result["series_id"]}
+    if (method, path) == ("POST", "/v1/quotas"):
+        return 200, store.set_quota(_require(payload, "tenant"),
+                                    payload.get("max_series"),
+                                    payload.get("max_points"))
+    if (method, path) == ("GET", "/v1/quotas"):
+        return 200, store.quota_status(_require(params, "tenant"))
     if (method, path) == ("GET", "/v1/query"):
         rows = store.query(_require(params, "tenant"), _require(params, "metric"), labels=labels,
                            start_ms=_int(params.get("start"), "start"),
