@@ -37,6 +37,7 @@ stderr and exits non-zero.
 | `quota-set` | `python3 -m obsd quota-set --tenant acme --max-series 1000 --max-points 1000000` |
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
+| `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
@@ -57,6 +58,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
+| POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}`, `400` on malformed entries, `409` on conflict or quota exceeded |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
@@ -112,6 +114,30 @@ and is counted in `duplicates`. A *different* value for a stored timestamp is a
 conflict: it raises `ObsError` (`409` over HTTP) unless `overwrite=True`, in
 which case the stored value is replaced and counted in `written`. A timestamp
 greater than the injected `now` (when `now` is given) is rejected.
+
+**Atomic multi-series write.** `write_batch(entries, now=None, overwrite=False)`
+(also `POST /v1/series/batch` and the CLI `write-batch --entries '<json>'`)
+applies a non-empty list of `{"tenant","metric","samples","labels"?}` entries
+(`labels` omitted means `{}`, no other keys allowed) as one all-or-nothing
+unit. Entries may span tenants and metrics and may repeat a series. `now` is
+`null`/omitted (no future check) or a non-boolean integer; `overwrite` must be
+a boolean (default `false`). The whole batch is validated before any conflict
+is reported, and all conflicts before any quota check. Entries and their
+samples are then applied in input order, so a later entry sees the earlier
+entries of the same batch: a same-value restatement is a duplicate, a
+differing value conflicts unless `overwrite` (then it replaces and counts as
+written). The result is `{"written","duplicates","results"}` with one
+`{"series_id","written","duplicates"}` per entry in input order; the totals
+are the per-entry sums. A successful batch with `written > 0` increases
+`stats()["writes"]` by exactly one; a pure-duplicate batch increases nothing.
+Quotas are charged per tenant with the batch's net new series and distinct new
+timestamps — duplicates and overwrites add no occupancy, and only dimensions
+that actually increase are checked. Any rejection (structure, missing fields,
+per-entry validation, future samples → `400`; conflict or quota → `409`)
+leaves no series, sample or write-count change behind, on disk included, and
+concurrent queries and quota reads only ever see the state before or after the
+whole batch. Replaying the same batch re-judges duplicates and overwrites in
+the same order.
 
 **Bucketing.** `query(..., step_ms=step, agg=agg)` assigns a sample with
 timestamp `t` to bucket `b = t - (t % step)`, i.e. buckets are
@@ -237,7 +263,8 @@ tenant's metrics together: `series` is the number of registered series and
 physical point-file lines. Label order, same-value replays, overwritten points
 and a timestamp repeated inside one batch add no occupancy.
 
-Every write path (`SeriesStore.write`, `POST /v1/series`, the CLI `write`) is
+Every write path (`SeriesStore.write`/`write_batch`, `POST /v1/series` and
+`/v1/series/batch`, the CLI `write`/`write-batch`) is
 checked after the existing input validation and conflict rules, using the
 batch's net increase: a batch is rejected (ObsError / HTTP `409` / CLI JSON
 error with non-zero exit) when *either* dimension it increases would exceed its
@@ -372,6 +399,9 @@ configuration/validation, net-increase enforcement and whole-batch rejection,
 zero/lowered limits with duplicates and overwrites, tenant isolation, quota
 release under retention, quota/usage consistency after reopen (including
 collapsed duplicate timestamp lines), concurrent writes/reconfiguration/pruning,
+atomic multi-series batches (cross-tenant/cross-metric entries, in-batch
+duplicate/overwrite ordering, all-or-nothing rejection on disk, per-tenant net
+quota accounting, single write-count increment, and the HTTP/CLI surfaces),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

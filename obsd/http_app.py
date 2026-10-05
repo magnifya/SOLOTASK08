@@ -64,6 +64,14 @@ def dispatch(store, engine, method, path, params, payload):
                              overwrite=bool(payload.get("overwrite", False)))
         return 202, {"written": result["written"], "duplicates": result["duplicates"],
                      "series_id": result["series_id"]}
+    if (method, path) == ("POST", "/v1/series/batch"):
+        # ``overwrite`` is passed through uncoerced: the store accepts only
+        # real booleans, just like ``now_ms`` accepts only non-bool integers.
+        result = store.write_batch(_require(payload, "entries"),
+                                   now=payload.get("now_ms"),
+                                   overwrite=payload.get("overwrite", False))
+        return 202, {"written": result["written"], "duplicates": result["duplicates"],
+                     "results": result["results"]}
     if (method, path) == ("GET", "/v1/query"):
         rows = store.query(_require(params, "tenant"), _require(params, "metric"), labels=labels,
                            start_ms=_int(params.get("start"), "start"),

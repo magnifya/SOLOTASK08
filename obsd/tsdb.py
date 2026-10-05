@@ -169,6 +169,30 @@ def parse_matchers_text(text, field="matchers"):
     return data
 
 
+def _clean_samples(samples, now):
+    """Validate ``samples`` against the optional clock; return clean pairs.
+
+    Shared by ``SeriesStore.write`` and ``SeriesStore.write_batch`` so single
+    and multi-series writes apply exactly the same sample rules.
+    """
+    if not isinstance(samples, (list, tuple)):
+        raise ObsError("samples must be a list of [timestamp_ms, value] pairs")
+    clean = []
+    for entry in samples:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ObsError("each sample must be a [timestamp_ms, value] pair")
+        stamp, value = entry
+        if not _num(stamp) or not _num(value):
+            raise ObsError("sample timestamp and value must be numbers")
+        if now is not None and int(stamp) > int(now):
+            raise ObsError("sample timestamp %d is in the future (now=%d)"
+                           % (int(stamp), int(now)))
+        clean.append((int(stamp), float(value)))
+    if not clean:
+        raise ObsError("samples must not be empty")
+    return clean
+
+
 def _aggregate(values, agg):
     if agg == "sum":
         return float(sum(values))
@@ -357,21 +381,7 @@ class SeriesStore:
         batch that would exceed either limit is rejected wholesale with
         ``ObsError``: no series, points or write counter change is kept.
         """
-        if not isinstance(samples, (list, tuple)):
-            raise ObsError("samples must be a list of [timestamp_ms, value] pairs")
-        clean = []
-        for entry in samples:
-            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                raise ObsError("each sample must be a [timestamp_ms, value] pair")
-            stamp, value = entry
-            if not _num(stamp) or not _num(value):
-                raise ObsError("sample timestamp and value must be numbers")
-            if now is not None and int(stamp) > int(now):
-                raise ObsError("sample timestamp %d is in the future (now=%d)"
-                               % (int(stamp), int(now)))
-            clean.append((int(stamp), float(value)))
-        if not clean:
-            raise ObsError("samples must not be empty")
+        clean = _clean_samples(samples, now)
         # Labels/tenant are validated before the lock so conflicts and quota
         # breaches never surface as identity errors.
         pairs = _labels_list(labels)
@@ -442,6 +452,158 @@ class SeriesStore:
                 self._writes += 1
                 self._save_registry()
         return {"series_id": sid, "written": written, "duplicates": duplicates}
+
+    def write_batch(self, entries, now=None, overwrite=False):
+        """Atomically store many series' samples in one all-or-nothing batch.
+
+        ``entries`` is a non-empty list of objects, each with exactly the
+        required fields ``tenant``, ``metric`` and ``samples`` plus an optional
+        ``labels`` (omitted means ``{}``); identity and sample validation are
+        the same as :meth:`write`. Entries may span tenants and metrics and
+        may repeat a series. ``now`` is ``None`` (no future check) or a
+        non-boolean integer; ``overwrite`` must be a boolean.
+
+        The whole batch is validated before any conflict is reported, and all
+        conflicts before any quota check. Entries and their samples are then
+        applied in input order, so a later entry sees the earlier entries of
+        the same batch: a same-value restatement counts as a duplicate, a
+        differing value conflicts unless ``overwrite`` (then it replaces and
+        counts as written). Quotas are charged per tenant with the batch's net
+        new series and distinct new timestamps — duplicates and overwrites add
+        no occupancy, and only dimensions that actually increase are checked.
+
+        Any rejection (structure, validation, future sample, conflict, quota)
+        raises ``ObsError`` and leaves no series, sample or write-count change
+        behind, on disk included. On success ``stats()["writes"]`` increases
+        by exactly one when the batch wrote anything; a pure-duplicate batch
+        increases nothing. Returns ``{"written", "duplicates", "results"}``
+        where ``results`` holds one ``{"series_id", "written", "duplicates"}``
+        per entry, in input order, and the totals are their sums.
+        """
+        if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
+            raise ObsError("now must be a non-boolean integer timestamp in ms or None")
+        if not isinstance(overwrite, bool):
+            raise ObsError("overwrite must be a boolean")
+        if not isinstance(entries, (list, tuple)) or not entries:
+            raise ObsError("entries must be a non-empty list of entry objects")
+        # Phase 1: validate every entry before any conflict or quota check, so
+        # a malformed later entry never masks an earlier conflict.
+        prepared = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ObsError("entry %d must be an object with tenant, metric "
+                               "and samples" % index)
+            if set(entry) - {"tenant", "metric", "samples", "labels"}:
+                raise ObsError("entry %d must contain only tenant, metric, "
+                               "samples and labels" % index)
+            for field in ("tenant", "metric", "samples"):
+                if entry.get(field) is None:
+                    raise ObsError("entry %d: missing field: %s" % (index, field))
+            clean = _clean_samples(entry["samples"], now)
+            pairs = _labels_list(entry.get("labels"))
+            identity = canonical_identity(entry["tenant"], entry["metric"], pairs)
+            sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            prepared.append((entry["tenant"], entry["metric"], pairs, identity,
+                             sid, clean))
+        with self._lock:
+            # Phase 2: replay the batch in input order against a private copy
+            # of the touched series, so later entries see earlier ones.
+            originals, merged = {}, {}
+            new_stamps, overwritten = {}, {}
+            results = []
+            total_written = total_duplicates = 0
+            for tenant, metric, pairs, identity, sid, clean in prepared:
+                if sid not in merged:
+                    originals[sid] = dict(self._samples.get(sid, ()))
+                    merged[sid] = dict(originals[sid])
+                    new_stamps[sid] = set()
+                    overwritten[sid] = False
+                state, stored = merged[sid], originals[sid]
+                written = duplicates = 0
+                for stamp, value in clean:
+                    if stamp in state:
+                        if state[stamp] != value:
+                            if not overwrite:
+                                raise ObsError(
+                                    "conflict for %s at timestamp %d: "
+                                    "stored=%r incoming=%r"
+                                    % (sid, stamp, state[stamp], value))
+                            if stamp in stored:
+                                overwritten[sid] = True
+                        else:
+                            duplicates += 1
+                            continue
+                    else:
+                        new_stamps[sid].add(stamp)
+                    state[stamp] = value
+                    written += 1
+                results.append({"series_id": sid, "written": written,
+                                "duplicates": duplicates})
+                total_written += written
+                total_duplicates += duplicates
+            # Phase 3: per-tenant quota check on the batch's net increase.
+            tenants = {}
+            for tenant, metric, pairs, identity, sid, clean in prepared:
+                usage = tenants.setdefault(tenant, {"sids": set(), "points": 0})
+                if sid not in usage["sids"]:
+                    usage["sids"].add(sid)
+                    usage["points"] += len(new_stamps[sid])
+            for tenant, usage in tenants.items():
+                quota = self._quotas.get(tenant)
+                if quota is None:
+                    continue
+                used_series = used_points = 0
+                for sid_, row in self._series.items():
+                    if row["tenant"] == tenant:
+                        used_series += 1
+                        used_points += len(self._samples[sid_])
+                new_series = sum(1 for sid in usage["sids"] if sid not in self._series)
+                new_points = usage["points"]
+                limit_series = quota["max_series"]
+                limit_points = quota["max_points"]
+                if new_series and limit_series is not None \
+                        and used_series + new_series > limit_series:
+                    raise ObsError(
+                        "quota exceeded for tenant %r: series %d+%d > max_series %s"
+                        % (tenant, used_series, new_series, limit_series))
+                if new_points and limit_points is not None \
+                        and used_points + new_points > limit_points:
+                    raise ObsError(
+                        "quota exceeded for tenant %r: points %d+%d > max_points %s"
+                        % (tenant, used_points, new_points, limit_points))
+            # Phase 4: commit. Everything before this point was in-memory
+            # simulation, so a rejection above leaves no trace anywhere.
+            if total_written:
+                committed = set()
+                for tenant, metric, pairs, identity, sid, clean in prepared:
+                    if sid in committed:
+                        continue
+                    committed.add(sid)
+                    if sid not in self._series:
+                        self._series[sid] = {"series_id": sid, "tenant": tenant,
+                                             "metric": metric, "labels": pairs,
+                                             "identity": identity}
+                        self._samples[sid] = []
+                    if not new_stamps[sid] and not overwritten[sid]:
+                        continue
+                    self._samples[sid] = sorted(merged[sid].items())
+                    if overwritten[sid]:
+                        # A stored value was replaced: rewrite the file so a
+                        # timestamp never occupies more than one physical line.
+                        self._rewrite_points(sid)
+                    else:
+                        fresh = sorted((stamp, merged[sid][stamp])
+                                       for stamp in new_stamps[sid])
+                        with open(self._points_path(sid), "a",
+                                  encoding="utf-8") as handle:
+                            handle.write("".join(_line(ts, value)
+                                                 for ts, value in fresh))
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                self._writes += 1
+                self._save_registry()
+        return {"written": total_written, "duplicates": total_duplicates,
+                "results": results}
 
     # ------------------------------------------------------------------- query
     def _matching_series(self, tenant, metric, labels, compiled_matchers=()):
