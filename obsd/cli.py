@@ -100,6 +100,23 @@ def _build_parser():
                        help='JSON array of {"key","op","value"} matchers; '
                             'op is one of =, !=, =~, !~ (AND with --label)')
 
+    export = _common(sub.add_parser("export", help="export a verifiable snapshot "
+                                                   "of raw samples"))
+    export.add_argument("--start", type=int, default=None)
+    export.add_argument("--end", type=int, default=None)
+    export.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                        help='JSON array of {"key","op","value"} matchers; '
+                             'op is one of =, !=, =~, !~ (AND with --label)')
+
+    replay = sub.add_parser("replay", help="replay an exported snapshot into "
+                                           "this store")
+    replay.add_argument("--snapshot", required=True, metavar="JSON",
+                        help="snapshot object as printed by the export command")
+    replay.add_argument("--now-ms", type=int, default=None)
+    replay.add_argument("--overwrite", action="store_true")
+    replay.add_argument("--dry-run", action="store_true",
+                        help="validate and count only; nothing is applied")
+
     rule = _common(sub.add_parser("rule-add", help="add an alert rule"))
     rule.add_argument("--id", default=None)
     rule.add_argument("--comparator", required=True, choices=COMPS)
@@ -215,6 +232,20 @@ def _run(args, store, engine, access):
                            agg=args.agg, group_by=group_by, window_ms=args.window_ms,
                            matchers=matchers)
         _emit({"series": [{"labels": row["labels"], "points": row["points"]} for row in rows]})
+    elif args.command == "export":
+        matchers = parse_matchers_text(args.matchers, "--matchers")
+        _emit(store.export_snapshot(args.tenant, args.metric,
+                                    labels=_labels(args.label),
+                                    start_ms=args.start, end_ms=args.end,
+                                    matchers=matchers))
+    elif args.command == "replay":
+        try:
+            snapshot = json.loads(args.snapshot)
+        except ValueError:
+            raise ObsError("--snapshot must be a JSON object as produced by export")
+        _emit(store.replay_snapshot(snapshot, now_ms=args.now_ms,
+                                    overwrite=args.overwrite,
+                                    dry_run=args.dry_run))
     elif args.command == "rule-add":
         _emit(engine.add_rule({
             "id": args.id, "tenant": args.tenant, "metric": args.metric,

@@ -75,7 +75,7 @@ def _request_scope(engine, method, path, params, payload):
     record, or ``None``.
     """
     if method == "GET":
-        if path == "/v1/query":
+        if path in ("/v1/query", "/v1/export"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
                     "/v1/alerts", "/v1/slos", "/v1/slos/status"):
@@ -87,6 +87,11 @@ def _request_scope(engine, method, path, params, payload):
             return "write", _tenant_set(payload.get("tenant")), \
                 _scope_tenant(payload.get("tenant"))
         if path == "/v1/series/batch":
+            tenants = _batch_scope(payload)
+            return "write", tenants, next(iter(tenants)) if len(tenants) == 1 else None
+        if path == "/v1/replay":
+            # Same per-entry tenant scoping as a batch write: any entry outside
+            # the caller's scope rejects the whole replay with 403.
             tenants = _batch_scope(payload)
             return "write", tenants, next(iter(tenants)) if len(tenants) == 1 else None
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/silences",
@@ -157,6 +162,15 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                                    overwrite=payload.get("overwrite", False))
         return 202, {"written": result["written"], "duplicates": result["duplicates"],
                      "results": result["results"]}
+    if (method, path) == ("POST", "/v1/replay"):
+        # The snapshot travels in the body together with the replay options;
+        # ``overwrite``/``dry_run`` pass through uncoerced (booleans only).
+        snapshot = {key: payload[key]
+                    for key in ("version", "snapshot_id", "entries") if key in payload}
+        result = store.replay_snapshot(snapshot, now_ms=payload.get("now_ms"),
+                                       overwrite=payload.get("overwrite", False),
+                                       dry_run=payload.get("dry_run", False))
+        return (202 if result["applied"] else 200), result
     if (method, path) == ("GET", "/v1/query"):
         rows = store.query(_require(params, "tenant"), _require(params, "metric"), labels=labels,
                            start_ms=_int(params.get("start"), "start"),
@@ -168,6 +182,12 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                            matchers=parse_matchers_text(params.get("matchers")))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
+    if (method, path) == ("GET", "/v1/export"):
+        return 200, store.export_snapshot(
+            _require(params, "tenant"), _require(params, "metric"), labels=labels,
+            start_ms=_int(params.get("start"), "start"),
+            end_ms=_int(params.get("end"), "end"),
+            matchers=parse_matchers_text(params.get("matchers")))
     if (method, path) == ("POST", "/v1/rules"):
         return 201, engine.add_rule(payload)
     if (method, path) == ("GET", "/v1/rules"):

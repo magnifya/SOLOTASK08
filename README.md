@@ -42,6 +42,8 @@ stderr and exits non-zero.
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
+| `export` | `python3 -m obsd export --tenant acme --metric latency_ms --start 0 --end 5000` |
+| `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
@@ -67,6 +69,8 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
 | POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}`, `400` on malformed entries, `409` on conflict or quota exceeded |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}` |
+| POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -194,6 +198,40 @@ leaves no series, sample or write-count change behind, on disk included, and
 concurrent queries and quota reads only ever see the state before or after the
 whole batch. Replaying the same batch re-judges duplicates and overwrites in
 the same order.
+
+**Snapshot export and replay.** `export_snapshot(tenant, metric, labels=None,
+start_ms=None, end_ms=None, matchers=None)` (also `GET /v1/export` and the CLI
+`export`) captures the raw samples of every matching series as a verifiable
+document `{"version": 1, "snapshot_id": ..., "entries": [...]}`. The filters
+and the closed `[start_ms, end_ms]` interval behave exactly as in `query`.
+Each entry holds only `tenant`, `metric`, `labels` and `samples` (ascending by
+timestamp); entries are ordered by `series_id` and registered series with no
+sample in range are omitted. `snapshot_id` is the SHA-256 of the sorted,
+compact JSON UTF-8 bytes of `{"version": 1, "entries": [...]}`. The export
+reads one coherent snapshot under a single lock acquisition and never changes
+write counters, quotas, alerts or query results, so exporting the same state
+twice yields identical content.
+
+`replay_snapshot(snapshot, now_ms=None, overwrite=False, dry_run=False)` (also
+`POST /v1/replay` and the CLI `replay --snapshot '<json>'`) verifies the
+document before storing anything: the version must be 1, `snapshot_id` must
+match the entries digest, and every entry then goes through the `write_batch`
+rules (labels, samples, future timestamps against `now_ms` when given,
+conflicts, per-tenant quotas). Invalid input or a digest mismatch is a `400`,
+a conflict or quota breach a `409`, and any failure leaves no in-memory or
+on-disk change behind. The result is `{"written", "duplicates", "results",
+"applied"}` with `results` in entry order. A dry run (`dry_run=true` /
+`--dry-run`) performs all validation and counting but applies nothing and
+reports `applied: false`; a real replay reports `applied: true` (`202` over
+HTTP, `200` for a dry run). Replaying a snapshot onto the state it came from
+is a pure duplicate replay (`written == 0`, the write counter does not move),
+replaying onto a partial state fills in only the missing points, and a replay
+after a restart re-judges exactly as an in-process one. Replay never mints new
+series identities and does not alter labels, tenant isolation, query
+aggregation, alert or SLO semantics. With access control enabled, export is a
+`read` operation scoped to the requested tenant and replay is a `write`
+operation checked per entry — any entry outside the caller's scope rejects the
+whole replay with `403` — and both are audited like every other endpoint.
 
 **Bucketing.** `query(..., step_ms=step, agg=agg)` assigns a sample with
 timestamp `t` to bucket `b = t - (t % step)`, i.e. buckets are
@@ -492,6 +530,11 @@ tenant-scope enforcement (`401`/`403`) with the anonymous surface unchanged
 while access control is off, per-entry batch authorization with atomic
 rejection, the persistent audit log (seq monotonic across restarts, filters
 and `limit` pagination on `GET /v1/audit`),
+verifiable snapshot export (filters, ordering, digest, side-effect-free
+repeatability across restarts) and replay (roundtrip migration, duplicate and
+missing-point re-judgement, dry runs, digest/validation/conflict/quota
+rejection without a trace, per-entry authorization, and the HTTP/CLI
+surfaces),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

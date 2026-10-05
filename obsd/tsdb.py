@@ -223,6 +223,12 @@ def _line(stamp, value):
     return json.dumps({"t": stamp, "v": value}, separators=(",", ":")) + "\n"
 
 
+def _snapshot_bytes(document):
+    """Canonical UTF-8 bytes of a snapshot document for its SHA-256 digest."""
+    return json.dumps(document, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
 class SeriesStore:
     """Append-mostly time series store persisted under ``root``.
 
@@ -480,6 +486,17 @@ class SeriesStore:
         where ``results`` holds one ``{"series_id", "written", "duplicates"}``
         per entry, in input order, and the totals are their sums.
         """
+        return self._apply_batch(entries, now=now, overwrite=overwrite, commit=True)
+
+    def _apply_batch(self, entries, now=None, overwrite=False, commit=True):
+        """The ``write_batch`` machinery; ``commit=False`` only validates and counts.
+
+        With ``commit=False`` every check runs exactly as for a real batch
+        (structure, samples, future timestamps, conflicts, quotas) and the
+        same ``{"written", "duplicates", "results"}`` preview is returned, but
+        no series, sample, counter or file ever changes. Used by snapshot
+        replay, where a dry run must prove applicable without applying.
+        """
         if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
             raise ObsError("now must be a non-boolean integer timestamp in ms or None")
         if not isinstance(overwrite, bool):
@@ -573,7 +590,7 @@ class SeriesStore:
                         % (tenant, used_points, new_points, limit_points))
             # Phase 4: commit. Everything before this point was in-memory
             # simulation, so a rejection above leaves no trace anywhere.
-            if total_written:
+            if commit and total_written:
                 committed = set()
                 for tenant, metric, pairs, identity, sid, clean in prepared:
                     if sid in committed:
@@ -604,6 +621,99 @@ class SeriesStore:
                 self._save_registry()
         return {"written": total_written, "duplicates": total_duplicates,
                 "results": results}
+
+    # ------------------------------------------------------------------ export
+    def export_snapshot(self, tenant, metric, labels=None, start_ms=None,
+                        end_ms=None, matchers=None):
+        """A verifiable snapshot of the matching series' raw samples.
+
+        Filters exactly like :meth:`query` (exact ``labels``, ``matchers`` and
+        the closed ``[start_ms, end_ms]`` interval) and returns
+        ``{"version": 1, "snapshot_id": ..., "entries": [...]}``. Each entry
+        holds only ``tenant``, ``metric``, ``labels`` and ``samples`` (the
+        in-range samples, ascending by timestamp); entries are ordered by
+        ``series_id`` and registered series with no sample in range are
+        omitted. ``snapshot_id`` is the SHA-256 of the sorted, compact JSON
+        UTF-8 bytes of ``{"version": 1, "entries": [...]}``, so any instance
+        can verify a snapshot before replaying it.
+
+        The whole export reads one coherent snapshot under a single lock
+        acquisition and never changes series, samples, write counters, quotas,
+        alerts or query results: exporting the same state twice yields
+        byte-identical content.
+        """
+        compiled_matchers = compile_matchers(matchers)
+        lo = None if start_ms is None else int(start_ms)
+        hi = None if end_ms is None else int(end_ms)
+        if lo is not None and hi is not None and hi < lo:
+            raise ObsError("end_ms must be >= start_ms")
+        entries = []
+        for sid, series_labels, samples in self._matching_series(
+                tenant, metric, labels, compiled_matchers):
+            rows = [[stamp, value] for stamp, value in samples
+                    if (lo is None or stamp >= lo) and (hi is None or stamp <= hi)]
+            if not rows:
+                continue
+            entries.append({"tenant": tenant, "metric": metric,
+                            "labels": series_labels, "samples": rows})
+        digest = hashlib.sha256(_snapshot_bytes(
+            {"version": 1, "entries": entries})).hexdigest()
+        return {"version": 1, "snapshot_id": digest, "entries": entries}
+
+    # ------------------------------------------------------------------ replay
+    def replay_snapshot(self, snapshot, now_ms=None, overwrite=False,
+                        dry_run=False):
+        """Validate and apply a snapshot produced by :meth:`export_snapshot`.
+
+        The snapshot is verified before anything is stored: ``version`` must
+        be 1, ``snapshot_id`` must equal the SHA-256 digest of the canonical
+        ``{"version": 1, "entries": [...]}`` document, and every entry is then
+        checked by the :meth:`write_batch` rules (labels, samples, future
+        timestamps against ``now_ms`` when given, conflicts, per-tenant
+        quotas) — invalid input or a digest mismatch raises ``ObsError``
+        (``400`` semantics), a conflict or quota breach raises ``ObsError``
+        (``409`` semantics), and any failure leaves no in-memory or on-disk
+        change behind.
+
+        With ``dry_run=True`` all validation and counting runs but nothing is
+        applied and the result carries ``applied=False``; otherwise the batch
+        commits and ``applied`` is ``True``. The result is ``{"written",
+        "duplicates", "results", "applied"}`` with ``results`` in entry order.
+        Replaying a snapshot onto the state it was exported from is a pure
+        duplicate replay (``written == 0``, the write counter does not move);
+        replaying onto a partial state fills in only the missing points. An
+        empty ``entries`` list is a valid no-op snapshot.
+        """
+        if not isinstance(dry_run, bool):
+            raise ObsError("dry_run must be a boolean")
+        if now_ms is not None and (isinstance(now_ms, bool)
+                                   or not isinstance(now_ms, int)):
+            raise ObsError("now_ms must be a non-boolean integer timestamp in ms or None")
+        if not isinstance(overwrite, bool):
+            raise ObsError("overwrite must be a boolean")
+        if not isinstance(snapshot, dict):
+            raise ObsError("snapshot must be an object with version, "
+                           "snapshot_id and entries")
+        version = snapshot.get("version")
+        if isinstance(version, bool) or version != 1:
+            raise ObsError("unsupported snapshot version: %r" % (version,))
+        entries = snapshot.get("entries")
+        if not isinstance(entries, list):
+            raise ObsError("snapshot entries must be a list")
+        snapshot_id = snapshot.get("snapshot_id")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise ObsError("snapshot_id must be a non-empty string")
+        digest = hashlib.sha256(_snapshot_bytes(
+            {"version": 1, "entries": entries})).hexdigest()
+        if snapshot_id != digest:
+            raise ObsError("snapshot_id does not match the entries digest")
+        if not entries:
+            return {"written": 0, "duplicates": 0, "results": [],
+                    "applied": not dry_run}
+        result = self._apply_batch(entries, now=now_ms, overwrite=overwrite,
+                                   commit=not dry_run)
+        return {"written": result["written"], "duplicates": result["duplicates"],
+                "results": result["results"], "applied": not dry_run}
 
     # ------------------------------------------------------------------- query
     def _matching_series(self, tenant, metric, labels, compiled_matchers=()):
