@@ -443,6 +443,219 @@ class SeriesStore:
                 self._save_registry()
         return {"series_id": sid, "written": written, "duplicates": duplicates}
 
+    # ---------------------------------------------------- multi-series writes
+    @staticmethod
+    def _clean_entry_samples(samples, now):
+        """Validate one batch entry's samples against the same rules as ``write``.
+
+        Returns ``[(int_stamp, float_value), ...]`` in input order. ``now`` is
+        either ``None`` (the future check is skipped) or an integer already
+        validated by the caller.
+        """
+        if not isinstance(samples, (list, tuple)):
+            raise ObsError("samples must be a list of [timestamp_ms, value] pairs")
+        clean = []
+        for entry in samples:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise ObsError("each sample must be a [timestamp_ms, value] pair")
+            stamp, value = entry
+            if not _num(stamp) or not _num(value):
+                raise ObsError("sample timestamp and value must be numbers")
+            if now is not None and int(stamp) > int(now):
+                raise ObsError("sample timestamp %d is in the future (now=%d)"
+                               % (int(stamp), int(now)))
+            clean.append((int(stamp), float(value)))
+        if not clean:
+            raise ObsError("samples must not be empty")
+        return clean
+
+    def write_batch(self, entries, now=None, overwrite=False):
+        """Atomically write samples for several series in one transaction.
+
+        ``entries`` is a non-empty array of objects, each with required
+        ``tenant`` (non-empty string), ``metric`` (non-empty string),
+        ``samples`` (non-empty ``[[timestamp_ms, value], ...]``) and optional
+        ``labels`` (an object, defaulting to ``{}``); no other fields are
+        allowed. The batch may span tenants and metrics and contain the same
+        series more than once. ``now`` is ``None`` (no future-sample check) or
+        an integer; ``overwrite`` is a boolean (default ``False``).
+
+        The whole request is validated first (every entry's structure, identity
+        and samples), conflicts are evaluated second, and per-tenant quotas
+        third. Entries and their samples are processed in input order, so a
+        later entry sees series and timestamps accumulated by earlier entries
+        in the same batch: an identical ``(series, timestamp)`` value is a
+        duplicate, a differing value conflicts unless ``overwrite=True``, in
+        which case it replaces and counts as written.
+
+        Quotas use each tenant's net new series and distinct new timestamps;
+        duplicates, overwrites and timestamps repeated within the batch add no
+        occupancy, and only dimensions that actually increase are checked (so
+        limits lowered below current usage still allow replays). Any rejection
+        leaves the store untouched. On success the point files and registry are
+        committed together under the store lock, and ``stats()["writes"]``
+        increases by exactly one when the batch wrote anything (a batch made
+        entirely of duplicates changes nothing).
+
+        Returns
+        ``{"written": n, "duplicates": m, "results": [{"series_id",
+        "written", "duplicates"}, ...]}`` with the per-entry results in input
+        order and totals equal to their sum.
+        """
+        if now is not None and (not isinstance(now, int) or isinstance(now, bool)):
+            raise ObsError("now must be an integer or null")
+        if not isinstance(overwrite, bool):
+            raise ObsError("overwrite must be a boolean")
+        if not isinstance(entries, (list, tuple)) or not entries:
+            raise ObsError("entries must be a non-empty array")
+        allowed = {"tenant", "metric", "samples", "labels"}
+        # Phase 1: validate every entry (structure, identity and samples) before
+        # any conflict or quota rule is examined.
+        prepared = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ObsError("entries[%d] must be an object" % index)
+            extra = set(entry) - allowed
+            if extra:
+                raise ObsError("entries[%d] has unknown field: %s"
+                               % (index, sorted(extra)[0]))
+            tenant = entry.get("tenant")
+            metric = entry.get("metric")
+            if "samples" not in entry:
+                raise ObsError("missing field: entries[%d].samples" % index)
+            if not isinstance(tenant, str) or not tenant:
+                raise ObsError("entries[%d].tenant must be a non-empty string" % index)
+            if not isinstance(metric, str) or not metric:
+                raise ObsError("entries[%d].metric must be a non-empty string" % index)
+            labels = entry.get("labels")
+            if labels is None:
+                labels = {}
+            elif not isinstance(labels, dict):
+                raise ObsError("entries[%d].labels must be an object" % index)
+            pairs = _labels_list(labels)
+            identity = canonical_identity(tenant, metric, pairs)
+            sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            samples = self._clean_entry_samples(entry["samples"], now)
+            prepared.append({"sid": sid, "tenant": tenant, "metric": metric,
+                             "pairs": pairs, "identity": identity, "samples": samples})
+
+        with self._lock:
+            # Phases 2-4 run under one lock acquisition on private working
+            # copies, so concurrent readers and writers see either the whole
+            # pre-batch or the whole post-batch state. A raised exception drops
+            # the copies without touching the committed state.
+            states = {}
+
+            def state_for(item):
+                sid = item["sid"]
+                state = states.get(sid)
+                if state is None:
+                    state = {
+                        "row": {"series_id": sid, "tenant": item["tenant"],
+                                "metric": item["metric"], "labels": item["pairs"],
+                                "identity": item["identity"]},
+                        "existed": sid in self._series,
+                        # Working copy of the series' timestamps; later entries
+                        # see everything earlier entries merged.
+                        "merged": dict(self._samples.get(sid, ())),
+                        # Timestamps with no physical line before this batch.
+                        "new_stamps": set(),
+                        "overwritten": False}
+                    states[sid] = state
+                return state
+
+            # Phase 2: conflicts in entry and sample input order.
+            results = []
+            total_written = total_duplicates = 0
+            for item in prepared:
+                state = state_for(item)
+                merged = state["merged"]
+                written = duplicates = 0
+                for stamp, value in item["samples"]:
+                    if stamp in merged:
+                        if merged[stamp] != value:
+                            if not overwrite:
+                                raise ObsError(
+                                    "conflict for %s at timestamp %d: stored=%r incoming=%r"
+                                    % (item["sid"], stamp, merged[stamp], value))
+                            if stamp not in state["new_stamps"]:
+                                # Replacing a value already on disk requires a
+                                # full point-file rewrite at commit time.
+                                state["overwritten"] = True
+                        else:
+                            duplicates += 1
+                            continue
+                    else:
+                        state["new_stamps"].add(stamp)
+                    merged[stamp] = value
+                    written += 1
+                results.append({"series_id": item["sid"], "written": written,
+                                "duplicates": duplicates})
+                total_written += written
+                total_duplicates += duplicates
+
+            # Phase 3: per-tenant net new series and distinct new timestamps.
+            tenants = {state["row"]["tenant"] for state in states.values()}
+            for tenant in tenants:
+                quota = self._quotas.get(tenant)
+                if quota is None:
+                    continue
+                used_series = used_points = 0
+                for sid_, row in self._series.items():
+                    if row["tenant"] == tenant:
+                        used_series += 1
+                        used_points += len(self._samples[sid_])
+                tenant_states = [st for st in states.values()
+                                 if st["row"]["tenant"] == tenant]
+                add_series = sum(1 for st in tenant_states if not st["existed"])
+                add_points = sum(len(st["new_stamps"]) for st in tenant_states)
+                limit_series = quota["max_series"]
+                limit_points = quota["max_points"]
+                if add_series and limit_series is not None \
+                        and used_series + add_series > limit_series:
+                    raise ObsError(
+                        "quota exceeded for tenant %r: series %d+%d > max_series %s"
+                        % (tenant, used_series, add_series, limit_series))
+                if add_points and limit_points is not None \
+                        and used_points + add_points > limit_points:
+                    raise ObsError(
+                        "quota exceeded for tenant %r: points %d+%d > max_points %s"
+                        % (tenant, used_points, add_points, limit_points))
+
+            # Phase 4: commit. Pure-duplicate batches have nothing to write and
+            # do not bump the writes counter.
+            if total_written:
+                registry_changed = False
+                for sid in sorted(states):
+                    state = states[sid]
+                    if not state["new_stamps"] and not state["overwritten"]:
+                        continue
+                    merged = state["merged"]
+                    if not state["existed"]:
+                        self._series[sid] = state["row"]
+                        self._samples[sid] = []
+                        registry_changed = True
+                    self._samples[sid] = sorted(merged.items())
+                    if state["overwritten"]:
+                        # Replaced values must not leave a timestamp on two
+                        # physical lines; rewrite the whole file once.
+                        self._rewrite_points(sid)
+                    else:
+                        fresh = sorted((stamp, merged[stamp])
+                                       for stamp in state["new_stamps"])
+                        with open(self._points_path(sid), "a",
+                                  encoding="utf-8") as handle:
+                            handle.write("".join(_line(ts, value)
+                                                 for ts, value in fresh))
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                self._writes += 1
+                if registry_changed:
+                    self._save_registry()
+
+        return {"written": total_written, "duplicates": total_duplicates,
+                "results": results}
+
     # ------------------------------------------------------------------- query
     def _matching_series(self, tenant, metric, labels, compiled_matchers=()):
         """Snapshot of every matching series: sid, labels and raw samples.

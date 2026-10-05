@@ -64,6 +64,17 @@ def dispatch(store, engine, method, path, params, payload):
                              overwrite=bool(payload.get("overwrite", False)))
         return 202, {"written": result["written"], "duplicates": result["duplicates"],
                      "series_id": result["series_id"]}
+    if (method, path) == ("POST", "/v1/series/batch"):
+        entries = _require(payload, "entries")
+        now_ms = payload.get("now_ms")
+        if now_ms is not None and (not isinstance(now_ms, int)
+                                   or isinstance(now_ms, bool)):
+            raise ObsError("now_ms must be an integer or null")
+        overwrite = payload.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            raise ObsError("overwrite must be a boolean")
+        result = store.write_batch(entries, now=now_ms, overwrite=overwrite)
+        return 202, result
     if (method, path) == ("GET", "/v1/query"):
         rows = store.query(_require(params, "tenant"), _require(params, "metric"), labels=labels,
                            start_ms=_int(params.get("start"), "start"),

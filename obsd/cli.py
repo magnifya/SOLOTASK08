@@ -77,6 +77,14 @@ def _build_parser():
     write.add_argument("--now-ms", type=int, default=None)
     write.add_argument("--overwrite", action="store_true")
 
+    write_batch = sub.add_parser(
+        "write-batch", help="atomically write samples for several series")
+    write_batch.add_argument("--entries", required=True, metavar="JSON_ARRAY",
+                             help='JSON array of {"tenant","metric","samples",'
+                                  '"labels"?} objects')
+    write_batch.add_argument("--now-ms", type=int, default=None)
+    write_batch.add_argument("--overwrite", action="store_true")
+
     query = _common(sub.add_parser("query", help="range query with optional bucketing"))
     query.add_argument("--start", type=int, default=None)
     query.add_argument("--end", type=int, default=None)
@@ -138,6 +146,14 @@ def _run(args, store, engine):
     elif args.command == "write":
         _emit(store.write(args.tenant, args.metric, _labels(args.label),
                           _samples(args.sample), now=args.now_ms, overwrite=args.overwrite))
+    elif args.command == "write-batch":
+        try:
+            entries = json.loads(args.entries)
+        except ValueError:
+            raise ObsError("--entries must be a JSON array of entry objects")
+        if not isinstance(entries, list):
+            raise ObsError("--entries must be a JSON array of entry objects")
+        _emit(store.write_batch(entries, now=args.now_ms, overwrite=args.overwrite))
     elif args.command == "query":
         group_by = None
         if args.group_by is not None:
