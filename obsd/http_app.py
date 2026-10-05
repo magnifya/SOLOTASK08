@@ -7,6 +7,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from .access import AccessControl, AuditLog, Forbidden, Unauthorized, \
+    authorize, request_tenant
 from .alerts import AlertEngine
 from .tsdb import ObsError, SeriesStore, parse_matchers_text
 
@@ -42,11 +44,20 @@ def _group_by(value):
         return json.loads(value)
     except ValueError:
         raise ObsError("group_by must be a JSON array of label keys")
-def dispatch(store, engine, method, path, params, payload):
+def dispatch(store, engine, method, path, params, payload, audit=None):
     """Pure routing: (status, body) or ObsError. No sockets involved."""
     labels = {key[6:]: value for key, value in params.items() if key.startswith("label.")}
     if (method, path) == ("GET", "/healthz"):
         return 200, {"ok": True}
+    if (method, path) == ("GET", "/v1/audit"):
+        if audit is None:
+            raise ObsError("not found: %s %s" % (method, path))
+        return 200, {"entries": audit.query(
+            tenant=params.get("tenant") or None,
+            principal_id=params.get("principal_id") or None,
+            outcome=params.get("outcome") or None,
+            after_seq=_int(params.get("after_seq"), "after_seq"),
+            limit=_int(params.get("limit"), "limit"))}
     if (method, path) == ("GET", "/v1/stats"):
         return 200, {"store": store.stats(), "alerts": len(engine.list_alerts())}
     if (method, path) == ("POST", "/v1/quotas"):
@@ -137,7 +148,15 @@ def _status_for(message):
     if message.startswith("unknown") and not message.startswith("unknown aggregation"):
         return 404
     return 409 if message.startswith(("conflict", "quota exceeded")) else 400
-def make_handler(store, engine):
+def _bearer_token(header):
+    """Extract the token from ``Authorization: Bearer <token>`` or ``None``."""
+    if not header:
+        return None
+    parts = header.split()
+    if len(parts) != 2 or parts[0] != "Bearer" or not parts[1]:
+        return None
+    return parts[1]
+def make_handler(store, engine, access=None, audit=None):
     class ObsdHandler(BaseHTTPRequestHandler):
         server_version = "obsd/0.1"
         sys_version = ""
@@ -171,22 +190,46 @@ def make_handler(store, engine):
             blank_params = parse_qs(parsed.query, keep_blank_values=True)
             if "matchers" in blank_params:
                 params["matchers"] = blank_params["matchers"][-1]
+            path = parsed.path
+            public = path == "/healthz"  # always open, never audited
+            guarded = not public and access is not None and access.enabled
+            principal = None
+            payload = {}
             try:
-                payload = self._read_json() if method == "POST" else {}
-                status, body = call(parsed.path, params, payload)
+                if guarded:
+                    principal = access.authenticate(
+                        _bearer_token(self.headers.get("Authorization")))
+                    if principal is None:
+                        raise Unauthorized()
+                if method == "POST":
+                    payload = self._read_json()
+                if guarded:
+                    authorize(engine, principal, method, path, params, payload)
+                status, body = call(path, params, payload)
+            except Unauthorized:
+                status, body = 401, {"error": "unauthorized"}
+            except Forbidden:
+                status, body = 403, {"error": "forbidden"}
             except ObsError as exc:
-                self._send(_status_for(str(exc)), {"error": str(exc)})
-                return
+                status, body = _status_for(str(exc)), {"error": str(exc)}
             except Exception as exc:  # pragma: no cover - defensive
-                self._send(500, {"error": "internal error: %s" % exc})
-                return
+                status, body = 500, {"error": "internal error: %s" % exc}
             self._send(status, body)
+            if not public and audit is not None:
+                try:
+                    tenant = request_tenant(engine, method, path, params, payload)
+                except Exception:  # pragma: no cover - defensive
+                    tenant = None
+                outcome = "denied" if status in (401, 403) \
+                    else "allowed" if 200 <= status < 300 else "failed"
+                audit.append(principal["id"] if principal else None,
+                             method, path, tenant, outcome, status)
         def do_GET(self):
             self._handle("GET", lambda path, params, payload:
-                         dispatch(store, engine, "GET", path, params, payload))
+                         dispatch(store, engine, "GET", path, params, payload, audit))
         def do_POST(self):
             self._handle("POST", lambda path, params, payload:
-                         dispatch(store, engine, "POST", path, params, payload))
+                         dispatch(store, engine, "POST", path, params, payload, audit))
         def do_DELETE(self):
             def call(path, params, payload):
                 if path.startswith("/v1/rules/"):
@@ -200,20 +243,26 @@ class ObsdHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, store, engine):
+    def __init__(self, address, store, engine, access=None, audit=None):
         self.store = store
         self.engine = engine
-        super().__init__(address, make_handler(store, engine))
-def create_server(store, engine, host="127.0.0.1", port=8080):
+        self.access = access
+        self.audit = audit
+        super().__init__(address, make_handler(store, engine, access, audit))
+def create_server(store, engine, host="127.0.0.1", port=8080, access=None, audit=None):
     """Build (but do not start) a ThreadingHTTPServer bound to ``host:port``."""
     if not isinstance(store, SeriesStore):
         raise ObsError("store must be a SeriesStore")
     if not isinstance(engine, AlertEngine):
         raise ObsError("engine must be an AlertEngine")
-    return ObsdHTTPServer((host, int(port)), store, engine)
-def run_server(store, engine, host="127.0.0.1", port=8080):
+    if access is None:
+        access = AccessControl(store.root)
+    if audit is None:
+        audit = AuditLog(store.root)
+    return ObsdHTTPServer((host, int(port)), store, engine, access, audit)
+def run_server(store, engine, host="127.0.0.1", port=8080, access=None, audit=None):
     """Serve until interrupted; prints one JSON startup line on stdout."""
-    server = create_server(store, engine, host, port)
+    server = create_server(store, engine, host, port, access=access, audit=audit)
     print(json.dumps({"ok": True, "listening": "http://%s:%d" % server.server_address[:2],
                       "data_dir": store.root}, sort_keys=True, separators=(",", ":")), flush=True)
     try:

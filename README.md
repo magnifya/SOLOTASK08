@@ -52,11 +52,16 @@ stderr and exits non-zero.
 | `notification-ack` | `python3 -m obsd notification-ack --id notification-00001` |
 | `slo set` | `python3 -m obsd slo set --tenant acme --name availability --metric latency_ms --good-comparator ">=" --threshold 1 --target-ratio 0.9 --window-ms 60000` |
 | `slo status` | `python3 -m obsd slo status --name availability --now-ms 60000` |
+| `principal-create` | `python3 -m obsd principal-create --id ops --token s3cret --role admin --tenant acme --tenant eu` |
+| `principal-list` | `python3 -m obsd principal-list` |
+| `principal-revoke` | `python3 -m obsd principal-revoke --id ops` |
 
 ## HTTP API
 
 Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
-404 (unknown resource) or 409 (write conflict or quota exceeded).
+404 (unknown resource) or 409 (write conflict or quota exceeded). When access
+control is configured (see below), requests can additionally fail with
+401 `{"error":"unauthorized"}` or 403 `{"error":"forbidden"}`.
 
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
@@ -80,6 +85,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | POST | `/v1/slos` | `{"tenant","name","metric","labels","good_comparator","threshold","target_ratio","window_ms"}` | `201` stored SLO |
 | GET | `/v1/slos/status` | `?tenant=&name=&now_ms=` | `200` SLO status object |
 | GET | `/v1/stats` | – | `200 {"store":{...},"alerts":n}` |
+| GET | `/v1/audit` | `?tenant=&principal_id=&outcome=&after_seq=&limit=` | `200 {"entries":[...]}` (admin only; entries ordered by ascending `seq`) |
 
 ## Data model
 
@@ -105,6 +111,8 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/inhibitions.json         <data-dir>/counters.json
 <data-dir>/routes.json              <data-dir>/notifications.json
 <data-dir>/notify_state.json        per-(route, alert) notification dedup state
+<data-dir>/principals.json          access principals (token SHA-256 digests only)
+<data-dir>/audit.jsonl              one audit record per non-healthz HTTP request
 ```
 
 A directory written before quotas existed simply has no `quotas.json`, which
@@ -401,6 +409,48 @@ budget). 98 good + 2 bad with `target_ratio = 0.95` gives `ratio = 0.98`,
 the budget still unspent). 90 good + 10 bad with `target_ratio = 0.99` gives
 `ratio = 0.9`, `burn_rate = 10.0`, `error_budget = 0.0`, `met = false`.
 
+**Access control.** Principals are managed locally through the CLI:
+`principal-create --id ID --token TOKEN --role viewer|writer|admin --tenant T
+[--tenant T ...]`, `principal-list` and `principal-revoke --id ID`. The id must
+be unique (a duplicate is a conflict), the token non-empty, and at least one
+tenant scope is required; only the token's SHA-256 digest is persisted in
+`principals.json` — the raw token never appears on disk, in CLI output or in
+audit records. Revoking hides the principal from `principal-list` and disables
+its token; revoking an unknown or already-revoked id is an "unknown principal"
+error. Access control is *enabled* exactly while `principals.json` exists:
+until the first principal is created the HTTP API stays fully anonymous (no
+401/403 anywhere, unchanged status codes, response fields and query results),
+and it stays enabled — rejecting every token — even after the last principal
+is revoked. A running server picks up CLI-side creates and revokes.
+
+While enabled, every non-`/healthz` request (`/healthz` is always public and
+never audited) must carry `Authorization: Bearer <token>`; a missing,
+malformed or unknown token is `401 {"error":"unauthorized"}`. An authenticated
+principal whose role or tenant scope does not cover the request is
+`403 {"error":"forbidden"}`. Roles are ordered `viewer < writer < admin`:
+viewers read resources inside their tenant scope; writers additionally write
+series, manage rules, silences, routes and SLOs and acknowledge notifications
+inside their scope; admins additionally perform quotas, inhibitions,
+evaluation, stats, the audit console and every cross-tenant operation (reads
+without a `tenant` parameter are cross-tenant and admin-only, and admins are
+not scope-checked). Batch writes check every entry's tenant before anything is
+written, so one out-of-scope entry rejects the whole batch with 403 and the
+batch stays atomic.
+
+**Audit.** Every non-`/healthz` HTTP request — authenticated or not, allowed,
+denied or failed — appends one record to `audit.jsonl` (flushed and fsynced):
+`{"seq","principal_id","method","path","tenant","outcome","status"}`. `seq` is
+monotonically increasing and continues across restarts; `principal_id` is
+`null` when the request is unauthenticated; `tenant` is the single tenant the
+request touches or `null` when there is none or several; `outcome` is
+`allowed` (2xx), `denied` (401/403) or `failed` (any other status); `status`
+is the final HTTP status. Records never contain tokens. `GET /v1/audit`
+(admin-only while access control is enabled) returns `{"entries":[...]}`
+ordered by ascending `seq`, filterable by `tenant`, `principal_id`, `outcome`
+(`allowed`/`denied`/`failed`) and `after_seq` (entries with `seq > after_seq`),
+with `limit` (a positive integer) for paging; an invalid `outcome`,
+`after_seq` or `limit` is a 400.
+
 **Determinism.** No module calls `time.time()` inside decision logic: `now_ms` is
 passed into `evaluate`, `slo_status` and `write` (the HTTP layer uses the wall
 clock only when a caller omits `now_ms` on `GET /v1/slos/status`, and
@@ -412,10 +462,11 @@ clock only when a caller omits `now_ms` on `GET /v1/slos/status`, and
 obsd/__init__.py    public exports
 obsd/tsdb.py        SeriesStore
 obsd/alerts.py      AlertEngine
+obsd/access.py      AccessControl (principals, authorization) + AuditLog
 obsd/http_app.py    ThreadingHTTPServer + create_server
 obsd/cli.py         command line interface
 obsd/__main__.py    python3 -m obsd entry point
-tests/              unittest suite (tsdb, alerts, http)
+tests/              unittest suite (tsdb, alerts, http, access)
 ```
 
 ## Tests
@@ -442,6 +493,12 @@ collapsed duplicate timestamp lines), concurrent writes/reconfiguration/pruning,
 atomic multi-series batches (cross-tenant/cross-metric entries, in-batch
 duplicate/overwrite ordering, all-or-nothing rejection on disk, per-tenant net
 quota accounting, single write-count increment, and the HTTP/CLI surfaces),
+principal create/list/revoke with digest-only token persistence, role and
+tenant-scope authorization over the live HTTP surface (401/403, cross-tenant
+reads, atomic batch scope checks, CLI-side edits reaching a running server),
+audit recording of every non-healthz request with restart-safe `seq`,
+filtering and paging, and the anonymous behaviour while access control is
+unconfigured,
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 
+from .access import AccessControl, ROLES
 from .alerts import AlertEngine
 from .http_app import run_server
 from .tsdb import ObsError, SeriesStore, parse_matchers_text
@@ -162,6 +163,21 @@ def _build_parser():
     slo_status.add_argument("--name", required=True)
     slo_status.add_argument("--tenant", default=None)
     slo_status.add_argument("--now-ms", type=int, required=True)
+
+    principal_create = sub.add_parser("principal-create",
+                                      help="create an access principal (token is never stored)")
+    principal_create.add_argument("--id", required=True, help="unique principal id")
+    principal_create.add_argument("--token", required=True,
+                                  help="bearer token; only its SHA-256 digest is persisted")
+    principal_create.add_argument("--role", required=True, choices=list(ROLES))
+    principal_create.add_argument("--tenant", action="append", required=True,
+                                  help="tenant scope; repeat for several tenants")
+
+    sub.add_parser("principal-list", help="list active access principals")
+
+    principal_revoke = sub.add_parser("principal-revoke",
+                                      help="revoke an access principal")
+    principal_revoke.add_argument("--id", required=True)
     return parser
 def _run(args, store, engine):
     if args.command == "serve":
@@ -225,6 +241,14 @@ def _run(args, store, engine):
                              args.window_ms))
     elif args.command == "slo":
         _emit(engine.slo_status(args.name, args.now_ms, tenant=args.tenant))
+    elif args.command == "principal-create":
+        _emit(AccessControl(store.root).create_principal(
+            args.id, args.token, args.role, args.tenant))
+    elif args.command == "principal-list":
+        _emit({"principals": AccessControl(store.root).list_principals()})
+    elif args.command == "principal-revoke":
+        AccessControl(store.root).revoke_principal(args.id)
+        _emit({"revoked": args.id})
     else:
         return _fail("unknown command: %s" % args.command)
     return 0
