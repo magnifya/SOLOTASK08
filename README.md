@@ -52,6 +52,9 @@ stderr and exits non-zero.
 | `notification-ack` | `python3 -m obsd notification-ack --id notification-00001` |
 | `slo set` | `python3 -m obsd slo set --tenant acme --name availability --metric latency_ms --good-comparator ">=" --threshold 1 --target-ratio 0.9 --window-ms 60000` |
 | `slo status` | `python3 -m obsd slo status --name availability --now-ms 60000` |
+| `principal-create` | `python3 -m obsd principal-create --id ops --token s3cret --role admin --tenant acme --tenant globex` |
+| `principal-list` | `python3 -m obsd principal-list` |
+| `principal-revoke` | `python3 -m obsd principal-revoke --id ops` |
 
 ## HTTP API
 
@@ -80,6 +83,45 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | POST | `/v1/slos` | `{"tenant","name","metric","labels","good_comparator","threshold","target_ratio","window_ms"}` | `201` stored SLO |
 | GET | `/v1/slos/status` | `?tenant=&name=&now_ms=` | `200` SLO status object |
 | GET | `/v1/stats` | – | `200 {"store":{...},"alerts":n}` |
+| GET | `/v1/audit` | `?tenant=&principal_id=&outcome=&after_seq=&limit=` | `200 {"entries":[{"seq","principal_id","method","path","tenant","outcome","status"},...]}` ascending by `seq` (admin only) |
+
+**Access control and audit.** Principals are managed locally through the CLI
+(`principal-create`/`principal-list`/`principal-revoke`); a principal is a
+unique `--id`, a non-empty `--token`, a `--role` of `viewer`, `writer` or
+`admin`, and at least one `--tenant` scope. Only the token's SHA-256 digest is
+persisted (`access.json`); the token itself never appears in any output,
+listing or audit record. A duplicate id is a conflict (`409` semantics), an
+unknown id on revoke is `unknown principal: ...` (`404` semantics). While no
+`access.json` exists, access control is off: every request stays anonymous,
+nothing returns `401`/`403`, no audit records are written and `/healthz` is
+always public either way.
+
+Once the config exists, every non-`/healthz` request must carry
+`Authorization: Bearer <token>`: a missing, malformed or unknown token gets
+`401 {"error":"unauthorized"}`. An authenticated principal whose role or
+tenant scope does not cover the request gets `403 {"error":"forbidden"}`.
+`viewer` reads resources inside its tenant scope; `writer` additionally
+writes series, manages rules, silences, routes and SLOs and acknowledges
+notifications inside its scope; `admin` additionally runs quotas, inhibitions,
+evaluation, stats and the audit endpoint, and is the only role allowed to run
+cross-tenant operations (requests with no single tenant, such as an
+unfiltered `GET /v1/alerts`). Batch writes are checked per entry: if any
+entry's tenant is outside the caller's scope the whole batch is rejected with
+`403` before anything is written, preserving atomicity. Principals created or
+revoked through the CLI take effect on a running server without a restart.
+
+Every non-`/healthz` request — authentication rejections, authorization
+denials and business failures included — appends one persistent audit record
+to `audit.jsonl` with a monotonically increasing `seq`:
+`{"seq","principal_id","method","path","tenant","outcome","status"}`, where
+`principal_id` is `null` when the request could not be authenticated,
+`tenant` is `null` when the request has no single tenant, and `outcome` is
+`allowed` (authorized, status < 400), `denied` (`401`/`403`) or `failed`
+(authorized but the business logic rejected it). The log is reloaded on
+startup, so records and the `seq` sequence survive restarts.
+`GET /v1/audit` (admin only) filters by `tenant`, `principal_id`, `outcome`
+and `after_seq` (entries with `seq > after_seq`) and pages with a positive
+integer `limit`; invalid filters are `400`, non-admin access is `403`.
 
 ## Data model
 
@@ -105,6 +147,8 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/inhibitions.json         <data-dir>/counters.json
 <data-dir>/routes.json              <data-dir>/notifications.json
 <data-dir>/notify_state.json        per-(route, alert) notification dedup state
+<data-dir>/access.json              principals: id, token SHA-256 digest, role, tenants
+<data-dir>/audit.jsonl              one audit record per line, seq monotonically increasing
 ```
 
 A directory written before quotas existed simply has no `quotas.json`, which
@@ -412,10 +456,11 @@ clock only when a caller omits `now_ms` on `GET /v1/slos/status`, and
 obsd/__init__.py    public exports
 obsd/tsdb.py        SeriesStore
 obsd/alerts.py      AlertEngine
+obsd/access.py      AccessControl (principals + audit log)
 obsd/http_app.py    ThreadingHTTPServer + create_server
 obsd/cli.py         command line interface
 obsd/__main__.py    python3 -m obsd entry point
-tests/              unittest suite (tsdb, alerts, http)
+tests/              unittest suite (tsdb, alerts, http, access)
 ```
 
 ## Tests
@@ -442,6 +487,11 @@ collapsed duplicate timestamp lines), concurrent writes/reconfiguration/pruning,
 atomic multi-series batches (cross-tenant/cross-metric entries, in-batch
 duplicate/overwrite ordering, all-or-nothing rejection on disk, per-tenant net
 quota accounting, single write-count increment, and the HTTP/CLI surfaces),
+principal create/list/revoke with digest-only token persistence, role and
+tenant-scope enforcement (`401`/`403`) with the anonymous surface unchanged
+while access control is off, per-entry batch authorization with atomic
+rejection, the persistent audit log (seq monotonic across restarts, filters
+and `limit` pagination on `GET /v1/audit`),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

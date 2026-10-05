@@ -7,6 +7,7 @@ import json
 import os
 import sys
 
+from .access import AccessControl
 from .alerts import AlertEngine
 from .http_app import run_server
 from .tsdb import ObsError, SeriesStore, parse_matchers_text
@@ -162,11 +163,33 @@ def _build_parser():
     slo_status.add_argument("--name", required=True)
     slo_status.add_argument("--tenant", default=None)
     slo_status.add_argument("--now-ms", type=int, required=True)
+
+    principal_create = sub.add_parser("principal-create",
+                                      help="create an access principal (token is "
+                                           "stored only as its SHA-256 digest)")
+    principal_create.add_argument("--id", required=True)
+    principal_create.add_argument("--token", required=True)
+    principal_create.add_argument("--role", required=True,
+                                  choices=["viewer", "writer", "admin"])
+    principal_create.add_argument("--tenant", action="append", required=True,
+                                  help="tenant scope; repeat for several")
+
+    sub.add_parser("principal-list", help="list access principals")
+
+    principal_revoke = sub.add_parser("principal-revoke",
+                                      help="revoke an access principal")
+    principal_revoke.add_argument("--id", required=True)
     return parser
-def _run(args, store, engine):
+def _run(args, store, engine, access):
     if args.command == "serve":
-        return run_server(store, engine, args.host, args.port)
-    if args.command == "quota-set":
+        return run_server(store, engine, args.host, args.port, access=access)
+    if args.command == "principal-create":
+        _emit(access.create_principal(args.id, args.token, args.role, args.tenant))
+    elif args.command == "principal-list":
+        _emit({"principals": access.list_principals()})
+    elif args.command == "principal-revoke":
+        _emit(access.revoke_principal(args.id))
+    elif args.command == "quota-set":
         _emit(store.set_quota(args.tenant, args.max_series, args.max_points))
     elif args.command == "quota-get":
         _emit(store.get_quota(args.tenant))
@@ -238,7 +261,7 @@ def main(argv=None):
     try:
         data_dir = os.path.abspath(args.data_dir)
         store = SeriesStore(data_dir)
-        return _run(args, store, AlertEngine(store, data_dir))
+        return _run(args, store, AlertEngine(store, data_dir), AccessControl(data_dir))
     except ObsError as exc:
         return _fail(exc)
     except (OSError, ValueError) as exc:

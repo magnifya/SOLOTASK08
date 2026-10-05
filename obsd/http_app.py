@@ -12,6 +12,12 @@ from .tsdb import ObsError, SeriesStore, parse_matchers_text
 
 __all__ = ["ObsdHTTPServer", "create_server", "make_handler", "run_server"]
 
+# Role ranks and the capability each endpoint needs: a viewer reads, a writer
+# also writes within its tenant scope, an admin does everything including
+# cross-tenant operations.
+_ROLE_RANK = {"viewer": 1, "writer": 2, "admin": 3}
+_CAPABILITY_RANK = {"read": 1, "write": 2, "admin": 3}
+
 
 def _int(value, field, default=None):
     if value is None or value == "":
@@ -42,13 +48,92 @@ def _group_by(value):
         return json.loads(value)
     except ValueError:
         raise ObsError("group_by must be a JSON array of label keys")
-def dispatch(store, engine, method, path, params, payload):
+def _tenant_set(value):
+    return {value} if isinstance(value, str) and value else set()
+def _scope_tenant(value):
+    return value if isinstance(value, str) and value else None
+def _batch_scope(payload):
+    """Per-entry tenants of a batch write; ``set()`` when not determinable."""
+    entries = payload.get("entries")
+    if isinstance(entries, list) and entries and all(
+            isinstance(entry, dict) for entry in entries):
+        return set().union(*(_tenant_set(entry.get("tenant")) for entry in entries))
+    return set()
+def _resource_tenant(rows, key, row_id):
+    """Tenant of one stored resource, or ``None`` when it does not exist."""
+    for row in rows:
+        if row.get("id") == row_id:
+            return row.get("tenant")
+    return None
+def _request_scope(engine, method, path, params, payload):
+    """Classify one request as ``(capability, tenants, audit_tenant)``.
+
+    ``tenants`` is ``None`` when no tenant check applies (the capability alone
+    decides); otherwise it is the set of tenants the principal must cover. An
+    empty set means the request has no single tenant — a cross-tenant
+    operation only an admin may run. ``audit_tenant`` is the single tenant to
+    record, or ``None``.
+    """
+    if method == "GET":
+        if path == "/v1/query":
+            return "read", _tenant_set(params.get("tenant")), params.get("tenant")
+        if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
+                    "/v1/alerts", "/v1/slos", "/v1/slos/status"):
+            return "read", _tenant_set(params.get("tenant")), params.get("tenant")
+        if path in ("/v1/quotas", "/v1/stats", "/v1/audit"):
+            return "admin", None, None
+    elif method == "POST":
+        if path == "/v1/series":
+            return "write", _tenant_set(payload.get("tenant")), \
+                _scope_tenant(payload.get("tenant"))
+        if path == "/v1/series/batch":
+            tenants = _batch_scope(payload)
+            return "write", tenants, next(iter(tenants)) if len(tenants) == 1 else None
+        if path in ("/v1/rules", "/v1/notification-routes", "/v1/silences",
+                    "/v1/slos"):
+            return "write", _tenant_set(payload.get("tenant")), \
+                _scope_tenant(payload.get("tenant"))
+        if path in ("/v1/quotas", "/v1/inhibitions", "/v1/evaluate"):
+            return "admin", None, None
+        if path.startswith("/v1/notifications/") and path.endswith("/ack"):
+            row_id = path[len("/v1/notifications/"):-len("/ack")]
+            tenant = _resource_tenant(engine.list_notifications(), "id", row_id)
+            # An unknown notification keeps the business 404; only a real one
+            # is checked against the caller's scope.
+            return ("write", _tenant_set(tenant), tenant) if tenant is not None \
+                else ("write", None, None)
+    elif method == "DELETE":
+        if path.startswith("/v1/rules/"):
+            tenant = _resource_tenant(engine.list_rules(), "id", path.rsplit("/", 1)[-1])
+            return ("write", _tenant_set(tenant), tenant) if tenant is not None \
+                else ("write", None, None)
+        if path.startswith("/v1/notification-routes/"):
+            tenant = _resource_tenant(engine.list_routes(), "id", path.rsplit("/", 1)[-1])
+            return ("write", _tenant_set(tenant), tenant) if tenant is not None \
+                else ("write", None, None)
+    # Unknown paths carry no tenant scope; dispatch answers 404.
+    return "read", None, None
+def _permitted(principal, capability, tenants):
+    """True when ``principal``'s role covers ``capability`` and ``tenants``."""
+    if _ROLE_RANK.get(principal["role"], 0) < _CAPABILITY_RANK[capability]:
+        return False
+    if principal["role"] == "admin" or tenants is None:
+        return True
+    return bool(tenants) and all(tenant in principal["tenants"] for tenant in tenants)
+def dispatch(store, engine, method, path, params, payload, access=None):
     """Pure routing: (status, body) or ObsError. No sockets involved."""
     labels = {key[6:]: value for key, value in params.items() if key.startswith("label.")}
     if (method, path) == ("GET", "/healthz"):
         return 200, {"ok": True}
     if (method, path) == ("GET", "/v1/stats"):
         return 200, {"store": store.stats(), "alerts": len(engine.list_alerts())}
+    if (method, path) == ("GET", "/v1/audit"):
+        entries = [] if access is None else access.query_audit(
+            tenant=params.get("tenant"), principal_id=params.get("principal_id"),
+            outcome=params.get("outcome"),
+            after_seq=_int(params.get("after_seq"), "after_seq"),
+            limit=_int(params.get("limit"), "limit"))
+        return 200, {"entries": entries}
     if (method, path) == ("POST", "/v1/quotas"):
         # Omitted limits default to unlimited; the store validates tenant and
         # limits and raises ObsError (-> 400) without touching the config.
@@ -137,7 +222,7 @@ def _status_for(message):
     if message.startswith("unknown") and not message.startswith("unknown aggregation"):
         return 404
     return 409 if message.startswith(("conflict", "quota exceeded")) else 400
-def make_handler(store, engine):
+def make_handler(store, engine, access=None):
     class ObsdHandler(BaseHTTPRequestHandler):
         server_version = "obsd/0.1"
         sys_version = ""
@@ -163,6 +248,15 @@ def make_handler(store, engine):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        def _bearer_token(self):
+            """The token of ``Authorization: Bearer <token>``, else ``None``."""
+            header = self.headers.get("Authorization")
+            if not header:
+                return None
+            parts = header.split()
+            if len(parts) != 2 or parts[0] != "Bearer":
+                return None
+            return parts[1]
         def _handle(self, method, call):
             parsed = urlparse(self.path)
             params = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
@@ -171,22 +265,56 @@ def make_handler(store, engine):
             blank_params = parse_qs(parsed.query, keep_blank_values=True)
             if "matchers" in blank_params:
                 params["matchers"] = blank_params["matchers"][-1]
+            # /healthz is always public and never audited. While no access
+            # config exists every request stays anonymous and unaudited.
+            guarded = access is not None and parsed.path != "/healthz"
+            if guarded:
+                access.refresh()
+                guarded = access.enabled()
+            principal = None
+            audit_tenant = params.get("tenant")
+            if guarded:
+                principal = access.authenticate(self._bearer_token())
+                if principal is None:
+                    self._send(401, {"error": "unauthorized"})
+                    access.record(None, method, parsed.path, audit_tenant,
+                                  "denied", 401)
+                    return
             try:
                 payload = self._read_json() if method == "POST" else {}
+            except ObsError as exc:
+                status = _status_for(str(exc))
+                self._send(status, {"error": str(exc)})
+                if guarded:
+                    access.record(principal["id"], method, parsed.path,
+                                  audit_tenant, "failed", status)
+                return
+            if guarded:
+                capability, tenants, audit_tenant = _request_scope(
+                    engine, method, parsed.path, params, payload)
+                if not _permitted(principal, capability, tenants):
+                    self._send(403, {"error": "forbidden"})
+                    access.record(principal["id"], method, parsed.path,
+                                  audit_tenant, "denied", 403)
+                    return
+            try:
                 status, body = call(parsed.path, params, payload)
             except ObsError as exc:
-                self._send(_status_for(str(exc)), {"error": str(exc)})
-                return
+                status, body = _status_for(str(exc)), {"error": str(exc)}
             except Exception as exc:  # pragma: no cover - defensive
-                self._send(500, {"error": "internal error: %s" % exc})
-                return
+                status, body = 500, {"error": "internal error: %s" % exc}
             self._send(status, body)
+            if guarded:
+                access.record(principal["id"], method, parsed.path, audit_tenant,
+                              "allowed" if status < 400 else "failed", status)
         def do_GET(self):
             self._handle("GET", lambda path, params, payload:
-                         dispatch(store, engine, "GET", path, params, payload))
+                         dispatch(store, engine, "GET", path, params, payload,
+                                  access=access))
         def do_POST(self):
             self._handle("POST", lambda path, params, payload:
-                         dispatch(store, engine, "POST", path, params, payload))
+                         dispatch(store, engine, "POST", path, params, payload,
+                                  access=access))
         def do_DELETE(self):
             def call(path, params, payload):
                 if path.startswith("/v1/rules/"):
@@ -200,20 +328,21 @@ class ObsdHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, store, engine):
+    def __init__(self, address, store, engine, access=None):
         self.store = store
         self.engine = engine
-        super().__init__(address, make_handler(store, engine))
-def create_server(store, engine, host="127.0.0.1", port=8080):
+        self.access = access
+        super().__init__(address, make_handler(store, engine, access))
+def create_server(store, engine, host="127.0.0.1", port=8080, access=None):
     """Build (but do not start) a ThreadingHTTPServer bound to ``host:port``."""
     if not isinstance(store, SeriesStore):
         raise ObsError("store must be a SeriesStore")
     if not isinstance(engine, AlertEngine):
         raise ObsError("engine must be an AlertEngine")
-    return ObsdHTTPServer((host, int(port)), store, engine)
-def run_server(store, engine, host="127.0.0.1", port=8080):
+    return ObsdHTTPServer((host, int(port)), store, engine, access)
+def run_server(store, engine, host="127.0.0.1", port=8080, access=None):
     """Serve until interrupted; prints one JSON startup line on stdout."""
-    server = create_server(store, engine, host, port)
+    server = create_server(store, engine, host, port, access=access)
     print(json.dumps({"ok": True, "listening": "http://%s:%d" % server.server_address[:2],
                       "data_dir": store.root}, sort_keys=True, separators=(",", ":")), flush=True)
     try:
