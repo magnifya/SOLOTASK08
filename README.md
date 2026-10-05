@@ -202,6 +202,25 @@ reopening the store. Omitting `window_ms` preserves the previous query
 behaviour exactly — `rollup`, write idempotency/overwrite, quotas, alerts and
 SLOs are unaffected.
 
+**Counter aggregates.** In sliding-window mode `agg` also accepts `increase`
+and `rate` (query entries only — `rollup`, alert rules and SLOs still reject
+them, and using them without `window_ms` fails the query). Each matching
+series is treated as a counter: within `(t - window_ms, t]` the time-sorted
+adjacent readings contribute their difference when non-decreasing, while a
+drop is a counter reset contributing only the later reading; the first reading
+contributes nothing. Only samples actually inside the window are used — no
+boundary borrowing, interpolation or extrapolation by window length.
+`increase` is the sum of those deltas, `rate` that sum divided by the seconds
+between the window's first and last sample. A window with fewer than two
+distinct sample timestamps emits `[t, null]`; unchanged readings emit `0`.
+Grouped queries compute each series independently and sum the non-null
+per-series results (never differencing across series); a group whose series
+are all null at a time emits null there. Any matched sample that actually
+falls into an output window and is negative or non-finite fails the whole
+query (`ObsError`, HTTP `400`, CLI non-zero with a one-line JSON error);
+samples outside every window or filtered out by labels/matchers are never
+inspected, and parameters are validated even when no series matches.
+
 **Retention.** `enforce_retention(tenant, cutoff_ms)` removes every sample of
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point
 files. `stats()` returns `{"series","points","writes","tenants"}`.

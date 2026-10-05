@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
 
-__all__ = ["ObsError", "SeriesStore", "AGGREGATES", "canonical_identity", "series_id_for"]
+__all__ = ["ObsError", "SeriesStore", "AGGREGATES", "COUNTER_AGGREGATES",
+           "canonical_identity", "series_id_for"]
 
 AGGREGATES = ("sum", "avg", "min", "max", "count")
+# Sliding-window-only counter aggregates: accepted by ``SeriesStore.query``
+# (and the HTTP/CLI query entries built on it) when ``window_ms`` is given.
+# Rollup, alert rules and SLOs keep validating against ``AGGREGATES`` alone.
+COUNTER_AGGREGATES = ("increase", "rate")
 MATCHER_OPS = ("=", "!=", "=~", "!~")
 
 
@@ -509,13 +515,33 @@ class SeriesStore:
         ``t``. Empty windows, including ``count``, emit ``None``. Every matching
         series (or group) gets the full time grid even when every window is
         empty; no matching series yields an empty list.
+
+        ``agg`` may also be ``increase`` or ``rate`` (sliding-window mode only;
+        without ``window_ms`` they are rejected). These treat each matching
+        series as a counter: per window, adjacent in-window readings contribute
+        their difference when non-decreasing, and a drop is treated as a
+        counter reset contributing only the later reading (the first reading
+        contributes nothing). ``increase`` is the sum of those deltas, ``rate``
+        that sum divided by the seconds between the window's first and last
+        sample. Only samples actually inside the window are used: no boundary
+        borrowing, no interpolation, no extrapolation. A window with fewer
+        than two distinct sample timestamps yields ``None``; unchanged readings
+        yield zero. Grouped queries compute each series independently and then
+        sum the non-``None`` per-series results of the group (never
+        differencing across series); a group whose series are all ``None`` at
+        a time yields ``None`` there. Any matched sample that actually falls
+        into an output window and is negative or non-finite fails the whole
+        query with ``ObsError``; samples outside every window or filtered out
+        by labels/matchers are never inspected.
         """
         # Compile before anything else so all matchers are validated even when
         # another argument (or the absence of candidate series) would yield an
         # empty result.
         compiled_matchers = compile_matchers(matchers)
-        if agg is not None and agg not in AGGREGATES:
+        if agg is not None and agg not in AGGREGATES + COUNTER_AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
+        if agg in COUNTER_AGGREGATES and window_ms is None:
+            raise ObsError("aggregation %r requires window_ms" % (agg,))
         if window_ms is not None:
             lo, hi, step, window = self._window_params(
                 start_ms, end_ms, step_ms, window_ms, agg)
@@ -586,6 +612,50 @@ class SeriesStore:
             points.append([t, None if not values else _aggregate(values, agg)])
         return points
 
+    @staticmethod
+    def _counter_value(windowed, agg):
+        """``increase``/``rate`` of one series over one window's samples.
+
+        ``windowed`` is the timestamp-sorted samples of a single series inside
+        ``(t - window, t]``. Every sample actually in the window must be a
+        non-negative finite number, else the whole query fails. Fewer than two
+        samples (hence fewer than two distinct timestamps) yield ``None``.
+        """
+        for stamp, value in windowed:
+            if not math.isfinite(value) or value < 0:
+                raise ObsError(
+                    "aggregation %r requires non-negative finite samples, "
+                    "got %r at timestamp %d" % (agg, value, stamp))
+        if len(windowed) < 2:
+            return None
+        total = 0.0
+        previous = windowed[0][1]
+        for _, value in windowed[1:]:
+            # A drop means the counter reset: count only the later reading.
+            total += value - previous if value >= previous else value
+            previous = value
+        if agg == "increase":
+            return total
+        span_seconds = (windowed[-1][0] - windowed[0][0]) / 1000.0
+        return total / span_seconds
+
+    def _window_counter_points(self, rows, window, times, agg):
+        """Per-time ``increase``/``rate`` for one series over the time grid."""
+        points = []
+        index = 0
+        for t in times:
+            left = t - window
+            while index < len(rows) and rows[index][0] <= left:
+                index += 1
+            windowed = []
+            for cursor in range(index, len(rows)):
+                stamp = rows[cursor][0]
+                if stamp > t:
+                    break
+                windowed.append(rows[cursor])
+            points.append([t, self._counter_value(windowed, agg)])
+        return points
+
     def _query_windows(self, tenant, metric, labels, lo, hi, step_ms, agg,
                        group_by, window, compiled_matchers=()):
         if group_by is not None:
@@ -599,10 +669,14 @@ class SeriesStore:
                 raise ObsError("group_by entries must not contain duplicates")
         times = list(self._window_grid(lo, hi, step_ms))
         matched = self._matching_series(tenant, metric, labels, compiled_matchers)
+        counter = agg in COUNTER_AGGREGATES
         if group_by is None:
             out = []
             for sid, series_labels, samples in matched:
-                points = self._window_values(samples, window, times, agg)
+                if counter:
+                    points = self._window_counter_points(samples, window, times, agg)
+                else:
+                    points = self._window_values(samples, window, times, agg)
                 out.append({"series_id": sid, "labels": dict(series_labels),
                             "points": points})
             return out
@@ -614,13 +688,26 @@ class SeriesStore:
             entry = groups.setdefault(token, {"labels": group_labels, "rows": []})
             # The first window reads history before start_ms; no window reads
             # anything past its own evaluation time, so no upper filter applies.
-            entry["rows"].extend(samples)
+            if counter:
+                # Counter aggregates are computed per series, never across
+                # series; the group sums the per-series results afterwards.
+                entry["rows"].append(
+                    self._window_counter_points(samples, window, times, agg))
+            else:
+                entry["rows"].extend(samples)
         out = []
         for token in sorted(groups):
             entry = groups[token]
-            rows = sorted(entry["rows"])
-            out.append({"labels": entry["labels"],
-                        "points": self._window_values(rows, window, times, agg)})
+            if counter:
+                points = []
+                for position, t in enumerate(times):
+                    values = [column[position][1] for column in entry["rows"]
+                              if column[position][1] is not None]
+                    points.append([t, sum(values) if values else None])
+            else:
+                rows = sorted(entry["rows"])
+                points = self._window_values(rows, window, times, agg)
+            out.append({"labels": entry["labels"], "points": points})
         return out
 
     def _bucket(self, rows, step_ms, agg, lo, hi):

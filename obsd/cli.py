@@ -13,6 +13,8 @@ from .tsdb import ObsError, SeriesStore, parse_matchers_text
 
 DEFAULT_DATA_DIR = "./obsd_data"
 AGGS = ["sum", "avg", "min", "max", "count"]
+# Sliding-window counter aggregates are query-only; rule-add keeps AGGS.
+QUERY_AGGS = AGGS + ["increase", "rate"]
 COMPS = [">", ">=", "<", "<=", "==", "!="]
 SEVERITIES = ["info", "warning", "critical"]
 
@@ -81,7 +83,7 @@ def _build_parser():
     query.add_argument("--step", type=int, default=None)
     query.add_argument("--window-ms", type=int, default=None,
                        help="sliding-window length in ms; requires --start/--end/--step/--agg")
-    query.add_argument("--agg", choices=AGGS, default=None)
+    query.add_argument("--agg", choices=QUERY_AGGS, default=None)
     query.add_argument("--group-by", default=None, metavar="JSON_ARRAY",
                        help="JSON array of label keys for cross-series grouping "
                             "(requires --agg; [] merges all matching series)")
