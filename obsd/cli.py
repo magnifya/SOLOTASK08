@@ -123,6 +123,31 @@ def _build_parser():
     silence.add_argument("--ends-ms", type=int, required=True)
     silence.add_argument("--reason", default="")
 
+    route_add = sub.add_parser("route-add", help="add a notification route")
+    route_add.add_argument("--tenant", required=True)
+    route_add.add_argument("--target", required=True)
+    route_add.add_argument("--id", default=None)
+    route_add.add_argument("--label", action="append", default=[],
+                           help="label matcher key=value (exact subset)")
+    route_add.add_argument("--severity", action="append", choices=SEVERITIES, default=None,
+                           help="restrict to a severity (repeatable; default all)")
+    route_add.add_argument("--event", action="append", choices=["firing", "resolved"],
+                           default=None, help="restrict to an event (repeatable; default both)")
+    route_add.add_argument("--repeat-ms", type=int, default=None,
+                           help="re-notify interval while firing (omit for no repeats)")
+
+    route_list = sub.add_parser("route-list", help="list notification routes")
+    route_list.add_argument("--tenant", default=None)
+
+    notifications = sub.add_parser("notification-list", help="list queued notifications")
+    notifications.add_argument("--tenant", default=None)
+    notifications.add_argument("--route-id", default=None)
+    notifications.add_argument("--alert-id", default=None)
+    notifications.add_argument("--acked", choices=["true", "false"], default=None)
+
+    ack = sub.add_parser("notification-ack", help="acknowledge a queued notification")
+    ack.add_argument("--id", required=True)
+
     slo = sub.add_parser("slo", help="SLO management")
     slo_sub = slo.add_subparsers(dest="slo_command", required=True)
     slo_set = _common(slo_sub.add_parser("set"))
@@ -179,6 +204,19 @@ def _run(args, store, engine):
     elif args.command == "silence-add":
         _emit(engine.add_silence(args.tenant, _labels(args.label), args.starts_ms,
                                  args.ends_ms, args.reason))
+    elif args.command == "route-add":
+        _emit(engine.add_route({
+            "id": args.id, "tenant": args.tenant, "target": args.target,
+            "labels": _labels(args.label), "severities": args.severity,
+            "events": args.event, "repeat_ms": args.repeat_ms}))
+    elif args.command == "route-list":
+        _emit({"routes": engine.list_routes(args.tenant)})
+    elif args.command == "notification-list":
+        acked = None if args.acked is None else args.acked == "true"
+        _emit({"notifications": engine.list_notifications(
+            args.tenant, args.route_id, args.alert_id, acked)})
+    elif args.command == "notification-ack":
+        _emit(engine.ack_notification(args.id))
     elif args.command == "slo" and args.slo_command == "set":
         _emit(engine.set_slo(args.tenant, args.name, args.metric, _labels(args.label),
                              args.good_comparator, args.threshold, args.target_ratio,
