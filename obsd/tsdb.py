@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -15,6 +16,9 @@ import threading
 __all__ = ["ObsError", "SeriesStore", "AGGREGATES", "canonical_identity", "series_id_for"]
 
 AGGREGATES = ("sum", "avg", "min", "max", "count")
+# Counter-style aggregations only accepted by sliding-window queries. They are
+# deliberately absent from AGGREGATES, so rollup and alert rules never see them.
+WINDOW_AGGREGATES = ("increase", "rate")
 MATCHER_OPS = ("=", "!=", "=~", "!~")
 
 
@@ -175,6 +179,27 @@ def _aggregate(values, agg):
     if agg == "count":
         return len(values)
     raise ObsError("unknown aggregation: %r" % (agg,))
+
+
+def _counter_increase(values):
+    """Sum of adjacent reading deltas for one window's sorted samples.
+
+    ``values`` is ordered by timestamp. A reading at or above the previous one
+    contributes their difference; a lower reading is a counter reset and
+    contributes only the new reading. The first reading contributes nothing.
+    Every value must be finite and non-negative; otherwise the whole query
+    fails with ``ObsError`` rather than returning a partial result.
+    """
+    total = 0.0
+    previous = None
+    for value in values:
+        if not math.isfinite(value) or value < 0:
+            raise ObsError(
+                "increase/rate requires finite non-negative samples, got %r" % (value,))
+        if previous is not None:
+            total += value - previous if value >= previous else value
+        previous = value
+    return total
 
 
 def _atomic_write(path, text):
@@ -509,18 +534,30 @@ class SeriesStore:
         ``t``. Empty windows, including ``count``, emit ``None``. Every matching
         series (or group) gets the full time grid even when every window is
         empty; no matching series yields an empty list.
+
+        ``increase`` and ``rate`` are accepted only in this mode: each series'
+        windowed samples are sorted by timestamp and reduced to adjacent
+        reading deltas (a lower reading is a counter reset contributing the
+        new reading alone; the first reading contributes nothing), ``increase``
+        is their sum and ``rate`` divides it by the first/last sample spacing
+        in seconds. Fewer than two distinct timestamps yields ``None``; a
+        negative or non-finite sample that actually falls in a window fails
+        the whole query. Grouped queries compute every series independently
+        and sum the non-null results per time.
         """
         # Compile before anything else so all matchers are validated even when
         # another argument (or the absence of candidate series) would yield an
         # empty result.
         compiled_matchers = compile_matchers(matchers)
-        if agg is not None and agg not in AGGREGATES:
+        if agg is not None and agg not in AGGREGATES and agg not in WINDOW_AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
         if window_ms is not None:
             lo, hi, step, window = self._window_params(
                 start_ms, end_ms, step_ms, window_ms, agg)
             return self._query_windows(tenant, metric, labels, lo, hi, step,
                                        agg, group_by, window, compiled_matchers)
+        if agg in WINDOW_AGGREGATES:
+            raise ObsError("aggregation %r requires a sliding window" % agg)
         if step_ms is not None and (not _num(step_ms) or int(step_ms) <= 0):
             raise ObsError("step_ms must be a positive number")
         lo = None if start_ms is None else int(start_ms)
@@ -571,6 +608,8 @@ class SeriesStore:
         length earlier is excluded. Empty windows (no samples, regardless of
         the aggregation, even ``count``) become ``None``.
         """
+        if agg in WINDOW_AGGREGATES:
+            return self._counter_window_values(rows, window, times, agg)
         points = []
         index = 0
         for t in times:
@@ -585,6 +624,41 @@ class SeriesStore:
                 values.append(rows[cursor][1])
             points.append([t, None if not values else _aggregate(values, agg)])
         return points
+
+    def _counter_window_values(self, rows, window, times, agg):
+        """``increase``/``rate`` over ``(t - window, t]`` for one sorted series.
+
+        Only samples actually inside the window are used: the sample just
+        outside the left edge is neither read nor borrowed, and nothing past
+        ``t`` is touched. Duplicate timestamps stay in timestamp order (each is
+        a real reading), while fewer than two distinct timestamps means no
+        first/last spacing, hence ``None``.
+        """
+        points = []
+        index = 0
+        for t in times:
+            left = t - window
+            while index < len(rows) and rows[index][0] <= left:
+                index += 1
+            window_rows = []
+            for cursor in range(index, len(rows)):
+                stamp = rows[cursor][0]
+                if stamp > t:
+                    break
+                window_rows.append(rows[cursor])
+            points.append([t, self._counter_value(window_rows, agg)])
+        return points
+
+    @staticmethod
+    def _counter_value(window_rows, agg):
+        """The increase/rate of one window's sorted ``(timestamp, value)`` rows."""
+        if len({stamp for stamp, _ in window_rows}) < 2:
+            return None
+        total = _counter_increase([value for _, value in window_rows])
+        if agg == "increase":
+            return total
+        spacing_ms = window_rows[-1][0] - window_rows[0][0]
+        return total / (spacing_ms / 1000.0)
 
     def _query_windows(self, tenant, metric, labels, lo, hi, step_ms, agg,
                        group_by, window, compiled_matchers=()):
@@ -611,17 +685,44 @@ class SeriesStore:
             group_labels = {key: series_labels[key] for key in keys
                             if key in series_labels}
             token = tuple(sorted(group_labels.items()))
-            entry = groups.setdefault(token, {"labels": group_labels, "rows": []})
+            entry = groups.setdefault(token, {"labels": group_labels, "rows": [],
+                                              "series": []})
             # The first window reads history before start_ms; no window reads
             # anything past its own evaluation time, so no upper filter applies.
             entry["rows"].extend(samples)
+            entry["series"].append(samples)
         out = []
         for token in sorted(groups):
             entry = groups[token]
-            rows = sorted(entry["rows"])
-            out.append({"labels": entry["labels"],
-                        "points": self._window_values(rows, window, times, agg)})
+            if agg in WINDOW_AGGREGATES:
+                # Counter aggs never take differences across series: reduce
+                # every series on its own first, then sum the non-null results
+                # sharing an evaluation time.
+                points = self._counter_group_values(entry["series"], window,
+                                                    times, agg)
+            else:
+                rows = sorted(entry["rows"])
+                points = self._window_values(rows, window, times, agg)
+            out.append({"labels": entry["labels"], "points": points})
         return out
+
+    def _counter_group_values(self, series_rows, window, times, agg):
+        """Per-time sums of independent per-series increase/rate values.
+
+        A series contributing ``None`` at a time simply adds nothing there; a
+        time where every series is null stays ``None`` rather than zero.
+        """
+        per_series = [self._counter_window_values(sorted(rows), window, times, agg)
+                      for rows in series_rows]
+        points = []
+        for index, t in enumerate(times):
+            total = None
+            for series_points in per_series:
+                value = series_points[index][1]
+                if value is not None:
+                    total = value if total is None else total + value
+            points.append([t, total])
+        return points
 
     def _bucket(self, rows, step_ms, agg, lo, hi):
         """``None`` = nothing to report, ``[]`` = known empty, else the points."""

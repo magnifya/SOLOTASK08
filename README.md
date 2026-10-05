@@ -41,6 +41,7 @@ stderr and exits non-zero.
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
+| `query` (counter) | `python3 -m obsd query --tenant acme --metric requests_total --start 0 --end 5000 --step 1000 --window-ms 5000 --agg increase` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
@@ -57,7 +58,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
 | POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects; `agg=increase`/`rate` require `window`) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/rules` | rule object | `201` stored rule |
@@ -202,6 +203,32 @@ reopening the store. Omitting `window_ms` preserves the previous query
 behaviour exactly — `rollup`, write idempotency/overwrite, quotas, alerts and
 SLOs are unaffected.
 
+**Counter increase and rate.** `agg=increase` and `agg=rate` are accepted
+*only* in sliding-window mode (they are rejected by raw/bucketed queries and
+by `rollup`, and alert rules keep the original five aggregations); the time
+grid, interval `(t - window_ms, t]`, parameter constraints and result shape
+are exactly the sliding-window ones. For each matching series the samples that
+actually fall in a window are taken in timestamp order and reduced to adjacent
+reading deltas: when the later reading is greater than or equal to the earlier
+one their difference counts, while a smaller reading is treated as a counter
+reset and only the later reading counts. Multiple resets are handled
+separately and the first reading in the window contributes nothing.
+`increase` is the sum of those deltas; `rate` divides that sum by the spacing
+between the first and last *samples* in seconds — never by the window length,
+with no interpolation, no borrowing of the point just outside the left edge
+and no extrapolation. A window with fewer than two distinct timestamps emits
+`[t, null]` (`None` in Python, `null` over HTTP/CLI); readings that never
+change legitimately return zero. Readings `10, 15, 3, 7` give
+`5 + 3 + 4 = 12`. Grouped queries reduce every series independently and then
+sum the non-null results at each evaluation time — differences are never taken
+across series; a time at which every series in the group is null stays null.
+The whole query fails with `ObsError` (`400` over HTTP, one JSON error line on
+stderr with non-zero exit from the CLI), returning no partial result, when a
+window parameter is missing or fails the sliding-window constraints (checked
+even when no series matches) or when any matching sample that actually falls
+inside an output window is negative or non-finite (`NaN`/infinity); samples
+outside every window or removed by label filtering never trigger the error.
+
 **Retention.** `enforce_retention(tenant, cutoff_ms)` removes every sample of
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point
 files. `stats()` returns `{"series","points","writes","tenants"}`.
@@ -344,7 +371,10 @@ buckets, null buckets, all five aggregations, deterministic rollups,
 sliding-window grids with left-open/right-closed windows, null empty windows
 (including count), full grids for empty series and groups, window argument
 validation across Python/HTTP/CLI, window snapshot consistency under
-concurrent writes and retention, retention,
+concurrent writes and retention, counter increase/rate windows (resets, the
+first-reading rule, sample-spacing rates, nulls for fewer than two
+timestamps, independent per-series group sums, negative/non-finite sample
+failures and window/label scoping of those errors), retention,
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label
