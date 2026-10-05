@@ -193,5 +193,58 @@ class TestHttpApi(HttpCase):
         self.assertAlmostEqual(status["error_budget"], 0.0)
         self.assertAlmostEqual(status["burn_rate"], 1.0)
         self.assertTrue(status["met"])
+    def test_notification_routes_and_queue(self):
+        self.write({}, [[0, 5.0]])
+        code, _ = self.request("POST", "/v1/rules", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {}, "comparator": "<",
+            "threshold": 10.0, "for_ms": 0, "window_ms": 60000, "agg": "avg",
+            "severity": "warning", "annotations": {}})
+        self.assertEqual(code, 201)
+        # Validation failures are 400, duplicates 409, unknown routes 404.
+        for bad in ({}, {"tenant": "acme"},
+                    {"tenant": "acme", "target": "t", "events": ["bogus"]},
+                    {"tenant": "acme", "target": "t", "severities": []},
+                    {"tenant": "acme", "target": "t", "repeat_ms": -1}):
+            code, body = self.request("POST", "/v1/notification-routes", bad)
+            self.assertEqual(code, 400, repr(bad))
+            self.assertIn("error", body)
+        code, route = self.request("POST", "/v1/notification-routes",
+                                   {"tenant": "acme", "target": "pager"})
+        self.assertEqual(code, 201)
+        self.assertEqual(route["id"], "route-0001")
+        self.assertEqual(route["events"], ["firing", "resolved"])
+        code, body = self.request("POST", "/v1/notification-routes",
+                                  {"id": "route-0001", "tenant": "acme", "target": "x"})
+        self.assertEqual(code, 409)
+        code, listed = self.request("GET", "/v1/notification-routes?tenant=acme")
+        self.assertEqual([row["id"] for row in listed["routes"]], ["route-0001"])
+        # Evaluating queues one firing notification for the matching route.
+        code, evaluated = self.request("POST", "/v1/evaluate", {"now_ms": 1000})
+        self.assertEqual(len(evaluated["firing"]), 1)
+        code, notes = self.request("GET", "/v1/notifications?tenant=acme&acked=false")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(notes["notifications"]), 1)
+        note = notes["notifications"][0]
+        self.assertEqual((note["route_id"], note["event"], note["created_ms"]),
+                         ("route-0001", "firing", 1000))
+        code, empty = self.request("GET", "/v1/notifications?acked=true")
+        self.assertEqual(empty["notifications"], [])
+        code, body = self.request("GET", "/v1/notifications?acked=maybe")
+        self.assertEqual(code, 400)
+        # Ack is idempotent; unknown ids are 404.
+        code, acked = self.request("POST", "/v1/notifications/%s/ack" % note["id"])
+        self.assertEqual(code, 200)
+        self.assertTrue(acked["acked"])
+        code, again = self.request("POST", "/v1/notifications/%s/ack" % note["id"])
+        self.assertEqual((code, again), (200, acked))
+        code, body = self.request("POST", "/v1/notifications/notification-99999/ack")
+        self.assertEqual(code, 404)
+        # Deleting the route keeps the queued notification.
+        code, deleted = self.request("DELETE", "/v1/notification-routes/route-0001")
+        self.assertEqual((code, deleted), (200, {"deleted": "route-0001"}))
+        code, body = self.request("DELETE", "/v1/notification-routes/route-0001")
+        self.assertEqual(code, 404)
+        code, notes = self.request("GET", "/v1/notifications?route_id=route-0001")
+        self.assertEqual(len(notes["notifications"]), 1)
 if __name__ == "__main__":
     unittest.main()

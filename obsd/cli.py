@@ -112,6 +112,33 @@ def _build_parser():
     evaluate = sub.add_parser("eval", help="evaluate all rules at a timestamp")
     evaluate.add_argument("--now-ms", type=int, required=True)
 
+    route = sub.add_parser("route-add", help="add a notification route")
+    route.add_argument("--tenant", required=True)
+    route.add_argument("--target", required=True)
+    route.add_argument("--id", default=None)
+    route.add_argument("--label", action="append", default=[],
+                       help="exact label matcher key=value (subset match)")
+    route.add_argument("--severity", action="append", default=None, choices=SEVERITIES,
+                       help="limit to these severities (default: all)")
+    route.add_argument("--event", action="append", default=None,
+                       choices=["firing", "resolved"],
+                       help="limit to these events (default: firing and resolved)")
+    route.add_argument("--repeat-ms", type=int, default=None,
+                       help="repeat a firing notification after this many ms "
+                            "(default: no repeat)")
+
+    route_list = sub.add_parser("route-list", help="list notification routes")
+    route_list.add_argument("--tenant", default=None)
+
+    notifications = sub.add_parser("notification-list", help="list queued notifications")
+    notifications.add_argument("--tenant", default=None)
+    notifications.add_argument("--route-id", default=None)
+    notifications.add_argument("--alert-id", default=None)
+    notifications.add_argument("--acked", default=None, choices=["true", "false"])
+
+    ack = sub.add_parser("notification-ack", help="acknowledge a notification")
+    ack.add_argument("--id", required=True)
+
     alerts = sub.add_parser("alerts", help="list alerts")
     alerts.add_argument("--tenant", default=None)
     alerts.add_argument("--state", default=None)
@@ -174,6 +201,19 @@ def _run(args, store, engine):
             "annotations": _labels(args.annotation)}))
     elif args.command == "eval":
         _emit(engine.evaluate(args.now_ms))
+    elif args.command == "route-add":
+        _emit(engine.add_route({
+            "id": args.id, "tenant": args.tenant, "target": args.target,
+            "labels": _labels(args.label), "severities": args.severity,
+            "events": args.event, "repeat_ms": args.repeat_ms}))
+    elif args.command == "route-list":
+        _emit({"routes": engine.list_routes(args.tenant)})
+    elif args.command == "notification-list":
+        _emit({"notifications": engine.list_notifications(
+            tenant=args.tenant, route_id=args.route_id, alert_id=args.alert_id,
+            acked=None if args.acked is None else args.acked == "true")})
+    elif args.command == "notification-ack":
+        _emit(engine.ack_notification(args.id))
     elif args.command == "alerts":
         _emit({"alerts": engine.list_alerts(args.tenant, args.state)})
     elif args.command == "silence-add":

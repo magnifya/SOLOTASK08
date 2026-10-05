@@ -87,6 +87,23 @@ def dispatch(store, engine, method, path, params, payload):
         return 201, engine.add_rule(payload)
     if (method, path) == ("GET", "/v1/rules"):
         return 200, {"rules": engine.list_rules(params.get("tenant"))}
+    if (method, path) == ("POST", "/v1/notification-routes"):
+        return 201, engine.add_route(payload)
+    if (method, path) == ("GET", "/v1/notification-routes"):
+        return 200, {"routes": engine.list_routes(params.get("tenant"))}
+    if (method, path) == ("GET", "/v1/notifications"):
+        acked = params.get("acked")
+        if acked is not None:
+            if acked not in ("true", "false"):
+                raise ObsError("acked must be true or false")
+            acked = acked == "true"
+        return 200, {"notifications": engine.list_notifications(
+            tenant=params.get("tenant"), route_id=params.get("route_id"),
+            alert_id=params.get("alert_id"), acked=acked)}
+    if method == "POST" and path.startswith("/v1/notifications/") \
+            and path.endswith("/ack"):
+        return 200, engine.ack_notification(
+            path[len("/v1/notifications/"):-len("/ack")])
     if (method, path) == ("POST", "/v1/evaluate"):
         return 200, engine.evaluate(_int(_require(payload, "now_ms"), "now_ms"))
     if (method, path) == ("GET", "/v1/alerts"):
@@ -172,9 +189,11 @@ def make_handler(store, engine):
                          dispatch(store, engine, "POST", path, params, payload))
         def do_DELETE(self):
             def call(path, params, payload):
-                if not path.startswith("/v1/rules/"):
-                    raise ObsError("not found: DELETE %s" % path)
-                return 200, engine.del_rule(path.rsplit("/", 1)[-1])
+                if path.startswith("/v1/rules/"):
+                    return 200, engine.del_rule(path.rsplit("/", 1)[-1])
+                if path.startswith("/v1/notification-routes/"):
+                    return 200, engine.del_route(path.rsplit("/", 1)[-1])
+                raise ObsError("not found: DELETE %s" % path)
             self._handle("DELETE", call)
     return ObsdHandler
 class ObsdHTTPServer(ThreadingHTTPServer):

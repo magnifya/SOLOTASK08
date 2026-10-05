@@ -13,7 +13,7 @@ import threading
 from .tsdb import ObsError, _atomic_write, _labels_list, matches_labels
 
 __all__ = ["AlertEngine", "COMPARATORS", "AGGREGATES", "SEVERITIES", "STATE_FIRING",
-           "STATE_SILENCED", "STATE_INHIBITED", "STATE_RESOLVED"]
+           "STATE_SILENCED", "STATE_INHIBITED", "STATE_RESOLVED", "EVENTS"]
 COMPARATORS = (">", ">=", "<", "<=", "==", "!=")
 AGGREGATES = ("sum", "avg", "min", "max", "count")
 SEVERITIES = ("info", "warning", "critical")
@@ -23,7 +23,9 @@ STATE_SILENCED = "silenced"
 STATE_INHIBITED = "inhibited"
 STATE_RESOLVED = "resolved"
 ACTIVE_STATES = (STATE_FIRING, STATE_SILENCED, STATE_INHIBITED)
-_FILES = ("rules", "alerts", "slos", "silences", "inhibitions", "counters")
+EVENTS = ("firing", "resolved")
+_FILES = ("rules", "alerts", "slos", "silences", "inhibitions", "counters",
+          "routes", "notifications", "notify_state")
 
 
 def _is_num(value):
@@ -53,7 +55,8 @@ class AlertEngine:
     """Rule evaluation with dedup, silences, inhibition and SLO tracking.
 
     Persisted under ``root`` as rules.json, alerts.json, slos.json,
-    silences.json, inhibitions.json and counters.json (atomic writes); a new
+    silences.json, inhibitions.json, counters.json, routes.json,
+    notifications.json and notify_state.json (atomic writes); a new
     instance reloads all of it, so alerts and rules survive a restart.
     """
 
@@ -66,7 +69,9 @@ class AlertEngine:
         self.root = os.path.abspath(str(root))
         self._lock = threading.RLock()
         self._rules, self._silences, self._inhibitions, self._slos, self._alerts = {}, {}, {}, {}, {}
-        self._counters = {"rule": 0, "silence": 0, "inhibition": 0, "alert": 0}
+        self._routes, self._notifications, self._notify_state = {}, {}, {}
+        self._counters = {"rule": 0, "silence": 0, "inhibition": 0, "alert": 0,
+                          "route": 0, "notification": 0}
         os.makedirs(self.root, exist_ok=True)
         self._load()
     # ------------------------------------------------------------- persistence
@@ -98,6 +103,13 @@ class AlertEngine:
         for row in self._read("alerts", []):
             row["firing"] = bool(row.get("firing")) and row.get("state") != STATE_RESOLVED
             self._alerts[(row["rule_id"], row["series_id"])] = row
+        for row in self._read("routes", []):
+            self._routes[row["id"]] = row
+        for row in self._read("notifications", []):
+            self._notifications[row["id"]] = row
+        for row in self._read("notify_state", []):
+            self._notify_state[(row["route_id"], row["alert_id"])] = {
+                "firing": bool(row.get("firing")), "last_ms": row.get("last_ms")}
         for key, value in self._read("counters", {}).items():
             if key in self._counters:
                 self._counters[key] = max(int(value), self._counters[key])
@@ -224,6 +236,134 @@ class AlertEngine:
                 if other_labels == wanted or (not row["same_labels"] and other_labels <= wanted):
                     return other["id"]
         return None
+    # -------------------------------------------------------- notification routes
+    def add_route(self, route):
+        """Validate and store a notification route; ``id`` is generated when omitted."""
+        if not isinstance(route, dict):
+            raise ObsError("route must be an object")
+        with self._lock:
+            clean = self._validate_route(route)
+            rid = clean["id"]
+            if rid is None:
+                while True:
+                    self._counters["route"] += 1
+                    rid = "route-%04d" % self._counters["route"]
+                    if rid not in self._routes:
+                        break
+                clean["id"] = rid
+            elif rid in self._routes:
+                raise ObsError("conflict: route id already exists: %s" % rid)
+            self._routes[rid] = clean
+            self._dump("routes", self._routes)
+        return copy.deepcopy(clean)
+    def _validate_route(self, route):
+        rid = route.get("id")
+        if rid is not None and (not isinstance(rid, str) or not rid):
+            raise ObsError("route id must be a non-empty string")
+        for field in ("tenant", "target"):
+            if not isinstance(route.get(field), str) or not route[field]:
+                raise ObsError("route %s must be a non-empty string" % field)
+        severities = self._route_choice(route.get("severities"), SEVERITIES, "severities")
+        events = self._route_choice(route.get("events"), EVENTS, "events")
+        repeat = route.get("repeat_ms")
+        if repeat is not None:
+            repeat = _require_int(repeat, "route repeat_ms")
+            if repeat < 0:
+                raise ObsError("route repeat_ms must be >= 0")
+        return {"id": rid, "tenant": route["tenant"], "target": route["target"],
+                "labels": _labels_list(route.get("labels")), "severities": severities,
+                "events": events, "repeat_ms": repeat}
+    @staticmethod
+    def _route_choice(value, allowed, field):
+        """A route selector: absent means all of ``allowed``; otherwise a non-empty
+        array of allowed values, normalised to ``allowed`` order without duplicates."""
+        if value is None:
+            return list(allowed)
+        if not isinstance(value, list) or not value:
+            raise ObsError("route %s must be a non-empty array" % field)
+        for item in value:
+            if item not in allowed:
+                raise ObsError("route %s must be one of %s" % (field, allowed))
+        return [item for item in allowed if item in value]
+    def list_routes(self, tenant=None):
+        with self._lock:
+            rows = [copy.deepcopy(self._routes[key]) for key in sorted(self._routes)]
+        return [row for row in rows if tenant is None or row["tenant"] == tenant]
+    def del_route(self, route_id):
+        """Delete a route; its historical notifications are kept."""
+        with self._lock:
+            if route_id not in self._routes:
+                raise ObsError("unknown route: %s" % route_id)
+            del self._routes[route_id]
+            self._dump("routes", self._routes)
+        return {"deleted": route_id}
+    # ------------------------------------------------------------- notifications
+    def _matching_routes(self, alert):
+        return [self._routes[rid] for rid in sorted(self._routes)
+                if self._routes[rid]["tenant"] == alert["tenant"]
+                and alert["severity"] in self._routes[rid]["severities"]
+                and matches_labels(alert["labels"], dict(self._routes[rid]["labels"]))]
+    def _route_event(self, alert, kind, now):
+        """Apply one alert transition to every matching route's dedup state.
+
+        ``kind`` is ``"firing"`` (alert is firing), ``"resolved"`` (alert just
+        resolved) or ``None`` (pending, silenced or inhibited: no notification,
+        and the firing episode ends so a later recovery re-notifies).
+        """
+        for route in self._matching_routes(alert):
+            key = (route["id"], alert["id"])
+            state = self._notify_state.get(key)
+            if kind is None:
+                if state is not None:
+                    state["firing"] = False
+                continue
+            if state is None:
+                state = self._notify_state[key] = {"firing": False, "last_ms": None}
+            if kind == "firing":
+                if "firing" in route["events"]:
+                    if not state["firing"]:
+                        self._emit_notification(route, alert, "firing", now)
+                        state["last_ms"] = now
+                    elif route["repeat_ms"] is not None and state["last_ms"] is not None \
+                            and now - state["last_ms"] >= route["repeat_ms"]:
+                        self._emit_notification(route, alert, "firing", now)
+                        state["last_ms"] = now
+                state["firing"] = True
+            else:  # resolved: exactly once per resolution
+                if "resolved" in route["events"]:
+                    self._emit_notification(route, alert, "resolved", now)
+                state["firing"] = False
+    def _emit_notification(self, route, alert, event, now):
+        self._counters["notification"] += 1
+        row = {"id": "notification-%05d" % self._counters["notification"],
+               "route_id": route["id"], "alert_id": alert["id"],
+               "tenant": route["tenant"], "target": route["target"], "event": event,
+               "created_ms": now, "alert": copy.deepcopy(alert), "acked": False}
+        self._notifications[row["id"]] = row
+    def _save_notify_state(self):
+        self._write("notify_state",
+                    [{"route_id": key[0], "alert_id": key[1],
+                      "firing": state["firing"], "last_ms": state["last_ms"]}
+                     for key, state in sorted(self._notify_state.items())])
+    def list_notifications(self, tenant=None, route_id=None, alert_id=None, acked=None):
+        """Filtered read of the notification queue; never consumes entries."""
+        with self._lock:
+            rows = [copy.deepcopy(self._notifications[key]) for key in sorted(self._notifications)]
+        return [row for row in rows
+                if (tenant is None or row["tenant"] == tenant)
+                and (route_id is None or row["route_id"] == route_id)
+                and (alert_id is None or row["alert_id"] == alert_id)
+                and (acked is None or row["acked"] == acked)]
+    def ack_notification(self, notification_id):
+        """Mark a notification acknowledged; re-acking returns the same record."""
+        with self._lock:
+            row = self._notifications.get(notification_id)
+            if row is None:
+                raise ObsError("unknown notification: %s" % notification_id)
+            if not row["acked"]:
+                row["acked"] = True
+                self._dump("notifications", self._notifications)
+            return copy.deepcopy(row)
     # --------------------------------------------------------------- evaluate
     def _condition(self, rule, series_id, now_ms):
         """Buckets of one series inside the rule window, plus the hold decision.
@@ -279,6 +419,7 @@ class AlertEngine:
                         if alert is not None and alert["state"] in ACTIVE_STATES:
                             alert.update(state=STATE_RESOLVED, firing=False, resolved_ms=now)
                             out[STATE_RESOLVED].append(copy.deepcopy(alert))
+                            self._route_event(alert, "resolved", now)
                         continue
                     if alert is None:
                         alert = {"id": self._next_alert_id(), "rule_id": rule["id"],
@@ -292,6 +433,7 @@ class AlertEngine:
                                  since_ms=state["run_start"], last_eval_ms=now,
                                  observed=state["observed"], held_ms=state["held_ms"])
                     if not state["for_satisfied"]:
+                        self._route_event(alert, None, now)
                         continue
                     silence = self._active_silence(rule["tenant"], state["labels"], now)
                     blocker = None if silence else self._inhibited(
@@ -300,16 +442,21 @@ class AlertEngine:
                         alert.update(state=STATE_SILENCED, silenced_by=silence["id"],
                                      silence_reason=silence["reason"])
                         out[STATE_SILENCED].append(copy.deepcopy(alert))
+                        self._route_event(alert, None, now)
                     elif blocker is not None:
                         alert.update(state=STATE_INHIBITED, inhibited_by=blocker)
                         out[STATE_INHIBITED].append(copy.deepcopy(alert))
+                        self._route_event(alert, None, now)
                     else:
                         alert.update(state=STATE_FIRING)
                         alert.pop("silenced_by", None)
                         alert.pop("inhibited_by", None)
                         out[STATE_FIRING].append(copy.deepcopy(alert))
+                        self._route_event(alert, "firing", now)
             self._write("alerts", [self._alerts[k] for k in
                                    sorted(self._alerts, key=lambda k: (k[0], k[1]))])
+            self._dump("notifications", self._notifications)
+            self._save_notify_state()
             self._write("counters", self._counters)
         for rows in out.values():
             rows.sort(key=lambda row: row["id"])

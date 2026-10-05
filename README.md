@@ -46,6 +46,10 @@ stderr and exits non-zero.
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
 | `silence-add` | `python3 -m obsd silence-add --tenant acme --starts-ms 0 --ends-ms 90000 --reason maintenance` |
+| `route-add` | `python3 -m obsd route-add --tenant acme --target pager --label host=a --severity critical --event firing --repeat-ms 300000` |
+| `route-list` | `python3 -m obsd route-list --tenant acme` |
+| `notification-list` | `python3 -m obsd notification-list --tenant acme --acked false` |
+| `notification-ack` | `python3 -m obsd notification-ack --id notification-00001` |
 | `slo set` | `python3 -m obsd slo set --tenant acme --name availability --metric latency_ms --good-comparator ">=" --threshold 1 --target-ratio 0.9 --window-ms 60000` |
 | `slo status` | `python3 -m obsd slo status --name availability --now-ms 60000` |
 
@@ -68,6 +72,11 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | GET | `/v1/alerts` | `?tenant=&state=` | `200 {"alerts":[...]}` |
 | POST | `/v1/silences` | `{"tenant","labels","starts_ms","ends_ms","reason"}` | `201` stored silence |
 | POST | `/v1/inhibitions` | `{"source_severity","target_severity","same_labels"}` | `201` stored inhibition |
+| POST | `/v1/notification-routes` | `{"tenant","target","labels"?,"severities"?,"events"?,"repeat_ms"?,"id"?}` | `201` stored route; `400` invalid, `409` duplicate id |
+| GET | `/v1/notification-routes` | `?tenant=` | `200 {"routes":[...]}` |
+| DELETE | `/v1/notification-routes/{id}` | – | `200 {"deleted":id}`; `404` unknown route (notifications are kept) |
+| GET | `/v1/notifications` | `?tenant=&route_id=&alert_id=&acked=` | `200 {"notifications":[...]}` (read-only, never consumes) |
+| POST | `/v1/notifications/{id}/ack` | – | `200` stored notification (re-ack returns the same record); `404` unknown notification |
 | POST | `/v1/slos` | `{"tenant","name","metric","labels","good_comparator","threshold","target_ratio","window_ms"}` | `201` stored SLO |
 | GET | `/v1/slos/status` | `?tenant=&name=&now_ms=` | `200` SLO status object |
 | GET | `/v1/stats` | – | `200 {"store":{...},"alerts":n}` |
@@ -94,6 +103,8 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
+<data-dir>/routes.json              <data-dir>/notifications.json
+<data-dir>/notify_state.json        per-(route, alert) notification dedup state
 ```
 
 A directory written before quotas existed simply has no `quotas.json`, which
@@ -103,7 +114,8 @@ construction so a reopen always reports a consistent snapshot.
 `SeriesStore` and `AlertEngine` each guard their state with a
 `threading.RLock`, so the threaded HTTP server can serve concurrent requests; all
 state is reloaded from disk on construction, so a restart preserves series,
-points, rules, alerts, silences, inhibitions and SLOs.
+points, rules, alerts, silences, inhibitions, SLOs, notification routes and
+queued notifications.
 
 ## Semantics and formulas
 
@@ -325,6 +337,34 @@ wins over inhibition. A silenced or inhibited alert still counts its
 `occurrences` and returns to `firing` as soon as the silence/inhibition no longer
 applies. `list_alerts(state=None)` filters by `firing`, `silenced`, `inhibited`
 or `resolved`.
+
+**Notification routing.** `add_route({"tenant","target","labels"?,"severities"?,
+"events"?,"repeat_ms"?,"id"?})` registers a notification route; `tenant` and
+`target` are required non-empty strings, `labels` is an exact label subset the
+alert's series must contain, `severities` (default: all severities) and
+`events` (default: `["firing","resolved"]`, the only two allowed values) are
+non-empty arrays when given, and `repeat_ms` is `null` or a non-negative
+integer. Invalid shapes raise `ObsError` (HTTP `400`), a duplicate `id` is a
+conflict (HTTP `409`), an unknown route is `404`; without an `id` the route is
+named `route-NNNN`. Deleting a route keeps its historical notifications.
+
+`evaluate(now_ms)` still returns only the four state lists, but every alert
+transition also appends to the notification queue of each matching route
+(tenant equal, route labels a subset of the series labels, alert severity in
+`severities`): an alert that enters `firing` — the first time, or when
+recovering from `silenced`/`inhibited` — produces one `firing` record; while
+the same firing state continues a repeat is emitted only when `repeat_ms` is
+set and that much time has passed since the route's last notification for the
+alert; entering `resolved` produces exactly one `resolved` record. Pending
+(`for_ms` not yet met), silenced and inhibited alerts never produce `firing`
+records. Dedup is tracked per route, so routes notify independently. Each
+record is `{"id": "notification-NNNNN","route_id","alert_id","tenant",
+"target","event","created_ms","alert": <snapshot>,"acked": false}` and is
+persisted across restarts together with the dedup state.
+`list_notifications(tenant, route_id, alert_id, acked)` reads the queue
+without consuming it; `ack_notification(id)` marks a record acknowledged,
+returns the same record on a repeated ack and raises `ObsError` (HTTP `404`)
+for an unknown id.
 
 **SLO and error budget.** `set_slo(tenant, name, metric, labels,
 good_comparator, threshold, target_ratio, window_ms)` defines a good-events
