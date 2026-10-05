@@ -14,7 +14,8 @@ import re
 import threading
 
 __all__ = ["ObsError", "SeriesStore", "AGGREGATES", "COUNTER_AGGREGATES",
-           "canonical_identity", "series_id_for"]
+           "canonical_identity", "series_id_for", "snapshot_digest",
+           "SNAPSHOT_VERSION"]
 
 AGGREGATES = ("sum", "avg", "min", "max", "count")
 # Sliding-window-only counter aggregates: accepted by ``SeriesStore.query``
@@ -22,6 +23,21 @@ AGGREGATES = ("sum", "avg", "min", "max", "count")
 # Rollup, alert rules and SLOs keep validating against ``AGGREGATES`` alone.
 COUNTER_AGGREGATES = ("increase", "rate")
 MATCHER_OPS = ("=", "!=", "=~", "!~")
+
+# Snapshot format version for export/replay.
+SNAPSHOT_VERSION = 1
+
+
+def snapshot_digest(entries):
+    """SHA-256 of the canonical snapshot payload ``{"version":1,"entries":...}``.
+
+    The digest covers the sorted, compact JSON encoding (UTF-8 bytes) of the
+    payload *without* the ``snapshot_id`` field itself, so the same entries
+    always yield the same id regardless of who computes it.
+    """
+    canonical = json.dumps({"version": SNAPSHOT_VERSION, "entries": entries},
+                           sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ObsError(Exception):
@@ -453,7 +469,7 @@ class SeriesStore:
                 self._save_registry()
         return {"series_id": sid, "written": written, "duplicates": duplicates}
 
-    def write_batch(self, entries, now=None, overwrite=False):
+    def write_batch(self, entries, now=None, overwrite=False, dry_run=False):
         """Atomically store many series' samples in one all-or-nothing batch.
 
         ``entries`` is a non-empty list of objects, each with exactly the
@@ -461,7 +477,10 @@ class SeriesStore:
         ``labels`` (omitted means ``{}``); identity and sample validation are
         the same as :meth:`write`. Entries may span tenants and metrics and
         may repeat a series. ``now`` is ``None`` (no future check) or a
-        non-boolean integer; ``overwrite`` must be a boolean.
+        non-boolean integer; ``overwrite`` must be a boolean. With
+        ``dry_run=True`` every validation, conflict and quota check runs and
+        the same counts are returned, but nothing is committed to memory or
+        disk and the write counter is left alone.
 
         The whole batch is validated before any conflict is reported, and all
         conflicts before any quota check. Entries and their samples are then
@@ -484,6 +503,8 @@ class SeriesStore:
             raise ObsError("now must be a non-boolean integer timestamp in ms or None")
         if not isinstance(overwrite, bool):
             raise ObsError("overwrite must be a boolean")
+        if not isinstance(dry_run, bool):
+            raise ObsError("dry_run must be a boolean")
         if not isinstance(entries, (list, tuple)) or not entries:
             raise ObsError("entries must be a non-empty list of entry objects")
         # Phase 1: validate every entry before any conflict or quota check, so
@@ -572,8 +593,9 @@ class SeriesStore:
                         "quota exceeded for tenant %r: points %d+%d > max_points %s"
                         % (tenant, used_points, new_points, limit_points))
             # Phase 4: commit. Everything before this point was in-memory
-            # simulation, so a rejection above leaves no trace anywhere.
-            if total_written:
+            # simulation, so a rejection above leaves no trace anywhere. A
+            # dry run stops here too: same counts, no state change at all.
+            if total_written and not dry_run:
                 committed = set()
                 for tenant, metric, pairs, identity, sid, clean in prepared:
                     if sid in committed:
@@ -943,6 +965,82 @@ class SeriesStore:
                  "points": [point for point in item["points"] if point[1] is not None]}
                 for item in self.query(tenant, metric, labels=labels,
                                        step_ms=int(window_ms), agg=agg)]
+
+    # --------------------------------------------------------------- snapshots
+    def export_snapshot(self, tenant, metric, labels=None, start_ms=None,
+                        end_ms=None, matchers=None):
+        """Verifiable history snapshot of one tenant/metric, for migration.
+
+        Returns ``{"version": 1, "snapshot_id": ..., "entries": [...]}`` where
+        each entry holds exactly ``tenant``, ``metric``, ``labels`` and
+        ``samples`` (ascending ``[timestamp_ms, value]`` pairs). Entries are
+        ordered by ``series_id`` and registered series with no sample inside
+        the closed ``[start_ms, end_ms]`` range are omitted. ``snapshot_id``
+        is :func:`snapshot_digest` of the entries. Exact ``labels`` and
+        ``matchers`` filter like :meth:`query`. The whole export reads one
+        coherent snapshot and changes nothing: no write counter, quota, alert
+        or query result is affected, and repeating it on unchanged state
+        yields byte-identical output.
+        """
+        compiled_matchers = compile_matchers(matchers)
+        lo = None if start_ms is None else int(start_ms)
+        hi = None if end_ms is None else int(end_ms)
+        if lo is not None and hi is not None and hi < lo:
+            raise ObsError("end_ms must be >= start_ms")
+        entries = []
+        for sid, series_labels, samples in self._matching_series(
+                tenant, metric, labels, compiled_matchers):
+            rows = [[stamp, value] for stamp, value in samples
+                    if (lo is None or stamp >= lo) and (hi is None or stamp <= hi)]
+            if not rows:
+                continue
+            row = self._series[sid]
+            entries.append({"tenant": row["tenant"], "metric": row["metric"],
+                            "labels": dict(series_labels), "samples": rows})
+        # ``_matching_series`` already returns series_id order.
+        return {"version": SNAPSHOT_VERSION, "snapshot_id": snapshot_digest(entries),
+                "entries": entries}
+
+    def replay_snapshot(self, snapshot, now=None, overwrite=False, dry_run=False):
+        """Apply a snapshot produced by :meth:`export_snapshot` to this store.
+
+        Validation runs in a fixed order before anything is applied: the
+        version must be :data:`SNAPSHOT_VERSION`, ``snapshot_id`` must match
+        :func:`snapshot_digest` of ``entries``, and every entry's labels and
+        samples (including the future-timestamp check against ``now``) must
+        satisfy the :meth:`write_batch` rules; conflicts and quotas are then
+        judged exactly like a batch write. Any rejection raises ``ObsError``
+        and leaves no memory or disk change behind.
+
+        With ``dry_run=True`` all checks and counts are produced but nothing
+        is applied and the result carries ``applied=False``; a real replay
+        carries ``applied=True``. The result is ``{"written", "duplicates",
+        "results", "applied"}`` with ``results`` in entry order. Replaying
+        onto identical data is all duplicates (``written == 0``, write counter
+        untouched); replaying onto partial data fills only the missing points.
+        """
+        if not isinstance(snapshot, dict):
+            raise ObsError("snapshot must be an object")
+        version = snapshot.get("version")
+        if isinstance(version, bool) or version != SNAPSHOT_VERSION:
+            raise ObsError("unsupported snapshot version: %r" % (version,))
+        entries = snapshot.get("entries")
+        digest = snapshot.get("snapshot_id")
+        if not isinstance(digest, str) or not digest:
+            raise ObsError("snapshot_id must be a non-empty string")
+        if digest != snapshot_digest(entries):
+            raise ObsError("snapshot digest mismatch")
+        if not isinstance(entries, list):
+            raise ObsError("snapshot entries must be a list")
+        if not isinstance(dry_run, bool):
+            raise ObsError("dry_run must be a boolean")
+        if not entries:
+            return {"written": 0, "duplicates": 0, "results": [],
+                    "applied": not dry_run}
+        result = self.write_batch(entries, now=now, overwrite=overwrite,
+                                  dry_run=dry_run)
+        result["applied"] = not dry_run
+        return result
 
     # --------------------------------------------------------------- retention
     def enforce_retention(self, tenant, cutoff_ms):
