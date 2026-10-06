@@ -35,6 +35,11 @@ def _require(payload, key):
     if payload.get(key) is None:
         raise ObsError("missing field: %s" % key)
     return payload[key]
+def _only(payload, keys):
+    """Reject any field outside ``keys`` (a typo must not pass silently)."""
+    for key in payload:
+        if key not in keys:
+            raise ObsError("unexpected field: %s" % key)
 def _labels(payload):
     value = payload.get("labels") or {}
     if not isinstance(value, dict):
@@ -80,6 +85,8 @@ def _request_scope(engine, method, path, params, payload):
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
                     "/v1/alerts", "/v1/slos", "/v1/slos/status"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
+        if path == "/v1/retention/policies":
+            return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/quotas", "/v1/stats", "/v1/audit"):
             return "admin", None, None
     elif method == "POST":
@@ -98,6 +105,16 @@ def _request_scope(engine, method, path, params, payload):
                     "/v1/slos"):
             return "write", _tenant_set(payload.get("tenant")), \
                 _scope_tenant(payload.get("tenant"))
+        if path == "/v1/retention/policies":
+            return "write", _tenant_set(payload.get("tenant")), \
+                _scope_tenant(payload.get("tenant"))
+        if path == "/v1/retention/run":
+            # With a tenant it is an ordinary tenant-scoped write; without one
+            # it sweeps every configured tenant — a cross-tenant operation
+            # only an admin may run (an empty scope set permits admins only).
+            tenant = payload.get("tenant")
+            return ("write", _tenant_set(tenant), _scope_tenant(tenant)) \
+                if tenant is not None else ("write", set(), None)
         if path in ("/v1/quotas", "/v1/inhibitions", "/v1/evaluate"):
             return "admin", None, None
         if path.startswith("/v1/notifications/") and path.endswith("/ack"):
@@ -147,6 +164,22 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                                     payload.get("max_points"))
     if (method, path) == ("GET", "/v1/quotas"):
         return 200, store.get_quota(_require(params, "tenant"))
+    if (method, path) == ("POST", "/v1/retention/policies"):
+        # An omitted retention_ms means null (no cleanup); the store validates
+        # the tenant and the policy and raises ObsError (-> 400) without
+        # touching the persisted config.
+        _only(payload, {"tenant", "retention_ms"})
+        return 200, store.set_retention(_require(payload, "tenant"),
+                                        payload.get("retention_ms"))
+    if (method, path) == ("GET", "/v1/retention/policies"):
+        return 200, store.get_retention(_require(params, "tenant"))
+    if (method, path) == ("POST", "/v1/retention/run"):
+        # ``dry_run`` passes through uncoerced: the store accepts only real
+        # booleans, just like ``now_ms`` accepts only non-bool integers.
+        _only(payload, {"tenant", "now_ms", "dry_run"})
+        return 200, store.run_retention(_require(payload, "now_ms"),
+                                        tenant=payload.get("tenant"),
+                                        dry_run=payload.get("dry_run", False))
     if (method, path) == ("POST", "/v1/series"):
         result = store.write(_require(payload, "tenant"), _require(payload, "metric"),
                              _labels(payload), _require(payload, "samples"),

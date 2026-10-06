@@ -36,6 +36,9 @@ stderr and exits non-zero.
 | `serve` | `python3 -m obsd --data-dir ./obsd_data serve --host 127.0.0.1 --port 8080` |
 | `quota-set` | `python3 -m obsd quota-set --tenant acme --max-series 1000 --max-points 1000000` |
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
+| `retention-set` | `python3 -m obsd retention-set --tenant acme --retention-ms 86400000` (omit `--retention-ms` for no cleanup) |
+| `retention-get` | `python3 -m obsd retention-get --tenant acme` |
+| `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run]` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
@@ -73,6 +76,9 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
+| POST | `/v1/retention/policies` | `{"tenant","retention_ms":n\|null}` | `200 {"tenant","retention_ms","series","points"}`; invalid tenant/policy or unknown fields give `400` and leave config untouched |
+| GET | `/v1/retention/policies` | `?tenant=` | `200 {"tenant","retention_ms","series","points"}` (unconfigured tenant reports a `null` policy and real usage) |
+| POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}`; missing/non-integer `now_ms`, non-boolean `dry_run` or unknown fields give `400` |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -146,6 +152,7 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/series.json              registry: series_id -> tenant/metric/labels
 <data-dir>/points/<series_id>.jsonl one {"t":ts,"v":value} object per line
 <data-dir>/quotas.json              tenant -> {"max_series","max_points"} limits
+<data-dir>/retention.json           tenant -> {"retention_ms"} retention policies
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
@@ -345,6 +352,34 @@ inspected, and parameters are validated even when no series matches.
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point
 files. `stats()` returns `{"series","points","writes","tenants"}`.
 
+**Retention policies and runs.** `set_retention(tenant, retention_ms)`
+persists the tenant's policy in `retention.json` (also `POST
+/v1/retention/policies` and the CLI `retention-set`); `retention_ms` is a
+non-negative integer or `null` (no cleanup), and `get_retention(tenant)`
+(also `GET /v1/retention/policies` and `retention-get`) returns
+`{"tenant","retention_ms","series","points"}` — the normalised policy plus the
+tenant's real usage, with a `null` policy for unconfigured tenants.
+`run_retention(now_ms, tenant=None, dry_run=False)` (also `POST
+/v1/retention/run` and `retention-run`) applies the configured policies as of
+the injected `now_ms` (a required non-boolean integer): with a `tenant` only
+that tenant is processed, otherwise every configured tenant in lexicographic
+order. For each tenant `cutoff_ms = now_ms - retention_ms` and only samples
+with `timestamp_ms < cutoff_ms` are dropped — a sample exactly at the cutoff
+is kept; a `null` policy reports a `null` cutoff and zero deletions. Affected
+point files are rewritten in compacted form (one physical record per
+timestamp, the final value winning, legacy duplicate lines collapsed), empty
+series stay registered, and the freed points count against the tenant's quota
+immediately. The result is `{"dry_run","tenants":[...]}` with a stable
+tenant order and `{"tenant","cutoff_ms","dropped","affected_series",
+"remaining_points","compacted_series"}` per tenant. The whole run is one
+atomic step under the store lock, so concurrent queries, quota and stats reads
+only ever see the complete state before or after it; `dry_run=true` reports
+the same numbers without touching memory, files, quotas or the write counter.
+Policies and sweep results survive a restart. With access control enabled,
+reading a policy is a tenant-scoped `read`, setting a policy and running a
+single-tenant sweep are tenant-scoped `write`s, a sweep across every
+configured tenant is admin-only, and all of them are audited.
+
 **Per-tenant quotas.** `set_quota(tenant, max_series, max_points)` sets the
 tenant-wide limits; each limit is a non-negative integer or `null` (omitted
 fields over HTTP also mean `null`, i.e. unlimited), and `0` forbids adding any.
@@ -522,6 +557,12 @@ configuration/validation, net-increase enforcement and whole-batch rejection,
 zero/lowered limits with duplicates and overwrites, tenant isolation, quota
 release under retention, quota/usage consistency after reopen (including
 collapsed duplicate timestamp lines), concurrent writes/reconfiguration/pruning,
+retention policy set/get/validation and persistence, retention runs (exclusive
+cutoff with the boundary point kept, lexicographic all-tenant sweeps, null
+policies, dry runs without side effects, physical compaction of duplicate
+timestamps, empty series staying registered, freed points reusable under quota,
+restart-stable results, whole-state visibility under concurrent reads, and the
+HTTP/CLI surfaces with tenant-scoped and admin-only access plus audit),
 atomic multi-series batches (cross-tenant/cross-metric entries, in-batch
 duplicate/overwrite ordering, all-or-nothing rejection on disk, per-tenant net
 quota accounting, single write-count increment, and the HTTP/CLI surfaces),
