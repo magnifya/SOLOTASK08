@@ -521,7 +521,7 @@ class AlertEngine:
         with self._lock:
             rows = [copy.deepcopy(self._slos[key]) for key in sorted(self._slos)]
         return [row for row in rows if tenant is None or row["tenant"] == tenant]
-    def slo_status(self, name, now_ms, tenant=None):
+    def slo_status(self, name, now_ms, tenant=None, read_token=None):
         """Event-ratio SLO status over ``[now_ms - window_ms, now_ms]``.
 
         Every stored sample in the window is one event: ``total`` counts them,
@@ -532,9 +532,16 @@ class AlertEngine:
             error_budget = max(0, 1 - (1 - ratio) / (1 - target))  (target < 1)
             burn_rate    = (bad / total) / (1 - target)            (0.0 if target >= 1)
             met          = ratio >= target
+
+        With ``read_token`` given the token is validated against the SLO's
+        tenant (see ``SeriesStore.check_read_token``) before any sample is
+        read; the budget math then runs on one coherent snapshot and never
+        changes the revision.
         """
         now = _require_int(now_ms, "now_ms")
         slo = self._find_slo(name, tenant)
+        if read_token is not None:
+            self.store.check_read_token(read_token, slo["tenant"])
         total = good = 0
         for _, rows in self.store._scan(slo["tenant"], slo["metric"], dict(slo["labels"]),
                                         now - slo["window_ms"], now):

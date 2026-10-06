@@ -93,11 +93,19 @@ def _build_parser():
     retention_run.add_argument("--now-ms", type=int, required=True)
     retention_run.add_argument("--dry-run", action="store_true",
                                help="report only; nothing is deleted or compacted")
+    retention_run.add_argument("--return-revision", action="store_true",
+                               help="include the commit revision in the result")
+
+    consistency_token = sub.add_parser("consistency-token",
+                                       help="mint a read-consistency token for a tenant")
+    consistency_token.add_argument("--tenant", required=True)
 
     write = _common(sub.add_parser("write", help="write samples into a series"))
     write.add_argument("--sample", action="append", default=[], metavar="TS:VALUE")
     write.add_argument("--now-ms", type=int, default=None)
     write.add_argument("--overwrite", action="store_true")
+    write.add_argument("--return-revision", action="store_true",
+                       help="include the commit revision in the result")
 
     write_batch = sub.add_parser("write-batch",
                                  help="atomically write many series from a JSON array")
@@ -106,6 +114,8 @@ def _build_parser():
                                   '"labels"?} entry objects')
     write_batch.add_argument("--now-ms", type=int, default=None)
     write_batch.add_argument("--overwrite", action="store_true")
+    write_batch.add_argument("--return-revision", action="store_true",
+                             help="include the commit revision in the result")
 
     query = _common(sub.add_parser("query", help="range query with optional bucketing"))
     query.add_argument("--start", type=int, default=None)
@@ -120,6 +130,8 @@ def _build_parser():
     query.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
                        help='JSON array of {"key","op","value"} matchers; '
                             'op is one of =, !=, =~, !~ (AND with --label)')
+    query.add_argument("--read-token", default=None,
+                       help="consistency token the read must catch up to")
 
     export = _common(sub.add_parser("export", help="export a verifiable snapshot "
                                                    "of raw samples"))
@@ -128,6 +140,8 @@ def _build_parser():
     export.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
                         help='JSON array of {"key","op","value"} matchers; '
                              'op is one of =, !=, =~, !~ (AND with --label)')
+    export.add_argument("--read-token", default=None,
+                        help="consistency token the read must catch up to")
 
     replay = sub.add_parser("replay", help="replay an exported snapshot into "
                                            "this store")
@@ -137,6 +151,8 @@ def _build_parser():
     replay.add_argument("--overwrite", action="store_true")
     replay.add_argument("--dry-run", action="store_true",
                         help="validate and count only; nothing is applied")
+    replay.add_argument("--return-revision", action="store_true",
+                        help="include the commit revision in the result")
 
     rule = _common(sub.add_parser("rule-add", help="add an alert rule"))
     rule.add_argument("--id", default=None)
@@ -201,6 +217,8 @@ def _build_parser():
     slo_status.add_argument("--name", required=True)
     slo_status.add_argument("--tenant", default=None)
     slo_status.add_argument("--now-ms", type=int, required=True)
+    slo_status.add_argument("--read-token", default=None,
+                            help="consistency token the read must catch up to")
 
     principal_create = sub.add_parser("principal-create",
                                       help="create an access principal (token is "
@@ -237,16 +255,22 @@ def _run(args, store, engine, access):
         _emit(store.get_retention(args.tenant))
     elif args.command == "retention-run":
         _emit(store.run_retention(args.now_ms, tenant=args.tenant,
-                                  dry_run=args.dry_run))
+                                  dry_run=args.dry_run,
+                                  return_revision=args.return_revision))
+    elif args.command == "consistency-token":
+        _emit(store.consistency_token(args.tenant))
     elif args.command == "write":
         _emit(store.write(args.tenant, args.metric, _labels(args.label),
-                          _samples(args.sample), now=args.now_ms, overwrite=args.overwrite))
+                          _samples(args.sample), now=args.now_ms,
+                          overwrite=args.overwrite,
+                          return_revision=args.return_revision))
     elif args.command == "write-batch":
         try:
             entries = json.loads(args.entries)
         except ValueError:
             raise ObsError("--entries must be a JSON array of entry objects")
-        _emit(store.write_batch(entries, now=args.now_ms, overwrite=args.overwrite))
+        _emit(store.write_batch(entries, now=args.now_ms, overwrite=args.overwrite,
+                                return_revision=args.return_revision))
     elif args.command == "query":
         group_by = None
         if args.group_by is not None:
@@ -258,14 +282,14 @@ def _run(args, store, engine, access):
         rows = store.query(args.tenant, args.metric, labels=_labels(args.label),
                            start_ms=args.start, end_ms=args.end, step_ms=args.step,
                            agg=args.agg, group_by=group_by, window_ms=args.window_ms,
-                           matchers=matchers)
+                           matchers=matchers, read_token=args.read_token)
         _emit({"series": [{"labels": row["labels"], "points": row["points"]} for row in rows]})
     elif args.command == "export":
         matchers = parse_matchers_text(args.matchers, "--matchers")
         _emit(store.export_snapshot(args.tenant, args.metric,
                                     labels=_labels(args.label),
                                     start_ms=args.start, end_ms=args.end,
-                                    matchers=matchers))
+                                    matchers=matchers, read_token=args.read_token))
     elif args.command == "replay":
         try:
             snapshot = json.loads(args.snapshot)
@@ -273,7 +297,8 @@ def _run(args, store, engine, access):
             raise ObsError("--snapshot must be a JSON object as produced by export")
         _emit(store.replay_snapshot(snapshot, now_ms=args.now_ms,
                                     overwrite=args.overwrite,
-                                    dry_run=args.dry_run))
+                                    dry_run=args.dry_run,
+                                    return_revision=args.return_revision))
     elif args.command == "rule-add":
         _emit(engine.add_rule({
             "id": args.id, "tenant": args.tenant, "metric": args.metric,
@@ -306,7 +331,8 @@ def _run(args, store, engine, access):
                              args.good_comparator, args.threshold, args.target_ratio,
                              args.window_ms))
     elif args.command == "slo":
-        _emit(engine.slo_status(args.name, args.now_ms, tenant=args.tenant))
+        _emit(engine.slo_status(args.name, args.now_ms, tenant=args.tenant,
+                                read_token=args.read_token))
     else:
         return _fail("unknown command: %s" % args.command)
     return 0

@@ -38,15 +38,16 @@ stderr and exits non-zero.
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
 | `retention-set` | `python3 -m obsd retention-set --tenant acme --retention-ms 86400000` (omit `--retention-ms` for no cleanup) |
 | `retention-get` | `python3 -m obsd retention-get --tenant acme` |
-| `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run]` |
-| `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
-| `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000` |
-| `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
+| `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run] [--return-revision]` |
+| `consistency-token` | `python3 -m obsd consistency-token --tenant acme` |
+| `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000 [--return-revision]` |
+| `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000 [--return-revision]` |
+| `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg [--read-token T]` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
-| `export` | `python3 -m obsd export --tenant acme --metric latency_ms --start 0 --end 5000` |
-| `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000` |
+| `export` | `python3 -m obsd export --tenant acme --metric latency_ms --start 0 --end 5000 [--read-token T]` |
+| `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000 [--return-revision]` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
@@ -56,29 +57,31 @@ stderr and exits non-zero.
 | `notification-list` | `python3 -m obsd notification-list --tenant acme --acked false` |
 | `notification-ack` | `python3 -m obsd notification-ack --id notification-00001` |
 | `slo set` | `python3 -m obsd slo set --tenant acme --name availability --metric latency_ms --good-comparator ">=" --threshold 1 --target-ratio 0.9 --window-ms 60000` |
-| `slo status` | `python3 -m obsd slo status --name availability --now-ms 60000` |
+| `slo status` | `python3 -m obsd slo status --name availability --now-ms 60000 [--read-token T]` |
 | `principal-create` | `python3 -m obsd principal-create --id ops --token s3cret --role admin --tenant acme --tenant globex` |
 | `principal-list` | `python3 -m obsd principal-list` |
 | `principal-revoke` | `python3 -m obsd principal-revoke --id ops` |
 
 ## HTTP API
 
-Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
-404 (unknown resource) or 409 (write conflict or quota exceeded).
+Errors are always JSON: `{"error":"..."}` with status 400 (bad request,
+including `invalid read token`), 404 (unknown resource) or 409 (write
+conflict, quota exceeded or `read revision unavailable`).
 
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
-| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `400` on malformed input or a non-boolean `now_ms`/`overwrite` (an explicit `null` `overwrite` is rejected, not treated as `false`), `409` on conflicting timestamp or quota exceeded |
-| POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}`, `400` on malformed entries, `409` on conflict or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
-| GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}` |
-| POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
+| GET | `/v1/consistency-token` | `?tenant=` | `200 {"tenant","token","revision"}` — mints a read-consistency token for the tenant |
+| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...],"now_ms"?,"overwrite"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"series_id":"..."}` (plus `"revision"` when `return_revision` is true), `400` on malformed input or a non-boolean `now_ms`/`overwrite`/`return_revision` (an explicit `null` `overwrite`/`return_revision` is rejected, not treated as `false`), `409` on conflicting timestamp or quota exceeded |
+| POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}` (plus `"revision"` when `return_revision` is true), `400` on malformed entries, `409` on conflict or quota exceeded |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=&read_token=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}`, `400` on an invalid read token, `409` while the token's revision is unavailable |
+| GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=&read_token=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}`, `400`/`409` on read-token failures |
+| POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run; plus `"revision"` when `return_revision` is true), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/retention/policies` | `{"tenant","retention_ms":n\|null}` | `200 {"tenant","retention_ms","series","points"}`; invalid tenant/policy or unknown fields give `400` and leave config untouched |
 | GET | `/v1/retention/policies` | `?tenant=` | `200 {"tenant","retention_ms","series","points"}` (unconfigured tenant reports a `null` policy and real usage) |
-| POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}`; missing/non-integer `now_ms`, non-boolean `dry_run` or unknown fields give `400` |
+| POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?,"return_revision"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}` (plus `"revision"` when `return_revision` is true); missing/non-integer `now_ms`, non-boolean `dry_run`/`return_revision` or unknown fields give `400` |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -91,7 +94,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | GET | `/v1/notifications` | `?tenant=&route_id=&alert_id=&acked=` | `200 {"notifications":[...]}` (read-only, never consumes) |
 | POST | `/v1/notifications/{id}/ack` | – | `200` stored notification (re-ack returns the same record); `404` unknown notification |
 | POST | `/v1/slos` | `{"tenant","name","metric","labels","good_comparator","threshold","target_ratio","window_ms"}` | `201` stored SLO |
-| GET | `/v1/slos/status` | `?tenant=&name=&now_ms=` | `200` SLO status object |
+| GET | `/v1/slos/status` | `?tenant=&name=&now_ms=&read_token=` | `200` SLO status object, `400`/`409` on read-token failures |
 | GET | `/v1/stats` | – | `200 {"store":{...},"alerts":n}` |
 | GET | `/v1/audit` | `?tenant=&principal_id=&outcome=&after_seq=&limit=` | `200 {"entries":[{"seq","principal_id","method","path","tenant","outcome","status"},...]}` ascending by `seq` (admin only) |
 
@@ -160,6 +163,7 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/notify_state.json        per-(route, alert) notification dedup state
 <data-dir>/access.json              principals: id, token SHA-256 digest, role, tenants
 <data-dir>/audit.jsonl              one audit record per line, seq monotonically increasing
+<data-dir>/revision.json            persistent revision counter + token-signing secret
 ```
 
 A directory written before quotas existed simply has no `quotas.json`, which
@@ -522,6 +526,47 @@ budget). 98 good + 2 bad with `target_ratio = 0.95` gives `ratio = 0.98`,
 the budget still unspent). 90 good + 10 bad with `target_ratio = 0.99` gives
 `ratio = 0.9`, `burn_rate = 10.0`, `error_budget = 0.0`, `met = false`.
 
+**Revisions and read consistency.** The store keeps one persistent,
+monotonically increasing *revision* in `revision.json`. Every successful
+commit that changes samples or the visible scope — a single write, a batch
+write, a snapshot replay or a retention run that actually drops samples —
+increases it exactly once. Pure duplicates, dry runs, validation failures,
+conflicts, quota rejections and retention runs that delete nothing do not
+move it, and neither do queries, exports or SLO status reads. The counter is
+reloaded on construction (and folded in from disk on demand), so numbering
+continues across restarts and stays monotonic when several instances share
+one data dir; a failed batch or replay leaves neither data nor a revision
+trace, and concurrent queries and retention sweeps only ever see the
+complete state before or after a commit.
+
+`consistency_token(tenant)` (also `GET /v1/consistency-token?tenant=` and
+the CLI `consistency-token`) returns `{"tenant", "token", "revision"}`: an
+HMAC-signed cursor binding the tenant to the current revision. The signing
+secret is persisted in `revision.json`, so tokens stay verifiable after a
+restart and across instances of the same data dir.
+
+The write paths accept an optional `return_revision` flag (`return_revision`
+in the HTTP bodies, `--return-revision` on the CLI `write`, `write-batch`,
+`replay` and `retention-run`). It must be a real boolean — an explicit
+`null` or any other type is rejected with `400` semantics before anything
+changes. When enabled, the result (Python dict, HTTP JSON or CLI one-line
+JSON) carries an extra `revision`: the commit revision when the call
+committed, otherwise the current revision. When omitted, results keep their
+previous shape exactly.
+
+`query`, `export_snapshot` and `slo_status` accept an optional `read_token`
+(`read_token` on `GET /v1/query`, `/v1/export` and `/v1/slos/status`,
+`--read-token` on the CLI). A read carrying a token is gated on the token's
+revision: it is processed only once this instance has caught up to it, and
+then runs on one coherent snapshot. Re-reading with the same token may see
+newer data but never older. A tampered, malformed, foreign or cross-tenant
+token fails with `invalid read token` (`400`); a token whose revision the
+instance has not reached yet fails with `read revision unavailable` (`409`).
+The consistency-token endpoint is an ordinary tenant-scoped read: with
+access control enabled only a principal covering the tenant can mint or use
+its tokens, and every request is audited as usual; while no `access.json`
+exists everything stays anonymous.
+
 **Determinism.** No module calls `time.time()` inside decision logic: `now_ms` is
 passed into `evaluate`, `slo_status` and `write` (the HTTP layer uses the wall
 clock only when a caller omits `now_ms` on `GET /v1/slos/status`, and
@@ -580,6 +625,12 @@ repeatability across restarts) and replay (roundtrip migration, duplicate and
 missing-point re-judgement, dry runs, digest/validation/conflict/quota
 rejection without a trace, per-entry authorization, and the HTTP/CLI
 surfaces),
+the persistent revision (single increments per committing write/batch/replay/
+retention run, no movement on duplicates, dry runs, rejections or reads,
+restart and multi-instance continuity) with `return_revision` on every write
+path, and read-consistency tokens (minting, tamper/cross-tenant/foreign
+rejection, unavailable-revision `409`s, monotonic re-reads, restart
+verifiability, and the HTTP/CLI surfaces with access control and audit),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

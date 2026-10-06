@@ -6,11 +6,14 @@ matters; nothing here calls time.time().
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import threading
 
 __all__ = ["ObsError", "SeriesStore", "AGGREGATES", "COUNTER_AGGREGATES",
@@ -22,6 +25,10 @@ AGGREGATES = ("sum", "avg", "min", "max", "count")
 # Rollup, alert rules and SLOs keep validating against ``AGGREGATES`` alone.
 COUNTER_AGGREGATES = ("increase", "rate")
 MATCHER_OPS = ("=", "!=", "=~", "!~")
+
+# Read-consistency tokens are ``<prefix>.<base64url payload>.<hmac hex>``;
+# the HMAC key is a per-data-dir secret persisted next to the revision.
+TOKEN_PREFIX = "obsd1"
 
 
 class ObsError(Exception):
@@ -248,14 +255,18 @@ class SeriesStore:
         self.series_path = os.path.join(self.root, "series.json")
         self.quota_path = os.path.join(self.root, "quotas.json")
         self.retention_path = os.path.join(self.root, "retention.json")
+        self.revision_path = os.path.join(self.root, "revision.json")
         self._lock = threading.RLock()
         self._series, self._samples, self._writes = {}, {}, 0
         self._quotas = {}
         self._retention = {}
+        self._revision = 0
+        self._secret = None
         os.makedirs(self.points_dir, exist_ok=True)
         self._load()
         self._load_quotas()
         self._load_retention()
+        self._load_revision()
 
     def _points_path(self, sid):
         return os.path.join(self.points_dir, sid + ".jsonl")
@@ -306,6 +317,171 @@ class SeriesStore:
     def _rewrite_points(self, sid):
         _atomic_write(self._points_path(sid),
                       "".join(_line(ts, value) for ts, value in self._samples[sid]))
+
+    # ---------------------------------------------------------------- revision
+    # The store keeps one persistent, monotonically increasing revision.
+    # Every successful commit that changes samples or the visible scope (a
+    # single write, a batch, a snapshot replay or a retention run that
+    # actually drops samples) increases it exactly once; pure duplicates,
+    # dry runs, validation failures, conflicts, quota rejections and
+    # no-op retention runs leave it untouched, as do all reads.
+    def _load_revision(self):
+        """Reload ``revision.json``; a missing file means revision 0."""
+        if not os.path.exists(self.revision_path):
+            return
+        try:
+            with open(self.revision_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ObsError("cannot read revision state: %s" % exc)
+        if not isinstance(data, dict):
+            raise ObsError("cannot read revision state: root must be an object")
+        revision = data.get("revision", 0)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ObsError("cannot read revision state: malformed revision")
+        secret = data.get("secret")
+        if secret is not None and not isinstance(secret, str):
+            raise ObsError("cannot read revision state: malformed secret")
+        self._revision = revision
+        self._secret = secret
+
+    def _save_revision(self):
+        _atomic_write(self.revision_path, json.dumps(
+            {"revision": self._revision, "secret": self._secret},
+            sort_keys=True, separators=(",", ":")))
+
+    def _disk_revision(self):
+        """The revision persisted on disk (0 when missing or unreadable)."""
+        try:
+            with open(self.revision_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            revision = data.get("revision", 0) if isinstance(data, dict) else 0
+            if isinstance(revision, int) and not isinstance(revision, bool) \
+                    and revision >= 0:
+                return revision
+        except (OSError, ValueError):
+            pass
+        return 0
+
+    def _refresh_revision(self):
+        """Fold in commits another instance of this data dir may have persisted."""
+        disk = self._disk_revision()
+        if disk > self._revision:
+            self._revision = disk
+
+    def _bump_revision(self):
+        """Advance the persistent revision by one; call only inside a commit."""
+        self._refresh_revision()
+        self._revision += 1
+        self._save_revision()
+        return self._revision
+
+    def _revision_now(self):
+        """The current revision, folding in other instances' commits."""
+        with self._lock:
+            self._refresh_revision()
+            return self._revision
+
+    def _ensure_secret(self):
+        """Mint and persist the token-signing secret on first use.
+
+        The persisted state is re-read first so a second instance of the same
+        data dir adopts the existing secret and revision instead of
+        clobbering them.
+        """
+        if self._secret is not None:
+            return
+        try:
+            with open(self.revision_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            revision = data.get("revision")
+            if isinstance(revision, int) and not isinstance(revision, bool) \
+                    and revision > self._revision:
+                self._revision = revision
+            secret = data.get("secret")
+            if isinstance(secret, str) and secret:
+                self._secret = secret
+                return
+        self._secret = secrets.token_hex(32)
+        self._save_revision()
+
+    # ------------------------------------------------------------- consistency
+    def consistency_token(self, tenant):
+        """A read-consistency token binding ``tenant`` to the current revision.
+
+        The token is an HMAC-signed ``{"tenant", "revision", "v"}`` payload;
+        the signing secret is persisted in ``revision.json``, so tokens stay
+        verifiable after a restart and across instances sharing the data dir.
+        """
+        tenant = self._clean_tenant(tenant)
+        with self._lock:
+            self._ensure_secret()
+            self._refresh_revision()
+            revision = self._revision
+            payload = json.dumps({"revision": revision, "tenant": tenant, "v": 1},
+                                 sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8")
+            body = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+            signature = hmac.new(self._secret.encode("ascii"), body.encode("ascii"),
+                                 hashlib.sha256).hexdigest()
+            token = "%s.%s.%s" % (TOKEN_PREFIX, body, signature)
+        return {"tenant": tenant, "token": token, "revision": revision}
+
+    def check_read_token(self, token, tenant):
+        """Validate ``token`` for reading ``tenant``; return its revision.
+
+        A tampered, malformed, foreign-secret or cross-tenant token raises
+        ``ObsError("invalid read token")`` (``400`` semantics); a token whose
+        revision this instance has not reached yet raises
+        ``ObsError("read revision unavailable")`` (``409`` semantics).
+        """
+        if not isinstance(token, str) or not token:
+            raise ObsError("invalid read token")
+        parts = token.split(".")
+        if len(parts) != 3 or parts[0] != TOKEN_PREFIX \
+                or not parts[1] or not parts[2]:
+            raise ObsError("invalid read token")
+        body, signature = parts[1], parts[2]
+        with self._lock:
+            self._ensure_secret()
+            secret = self._secret
+        expected = hmac.new(secret.encode("ascii"), body.encode("ascii"),
+                            hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise ObsError("invalid read token")
+        try:
+            padding = "=" * (-len(body) % 4)
+            payload = json.loads(
+                base64.urlsafe_b64decode(body + padding).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ObsError("invalid read token")
+        if not isinstance(payload, dict) or payload.get("v") != 1:
+            raise ObsError("invalid read token")
+        token_tenant = payload.get("tenant")
+        revision = payload.get("revision")
+        if not isinstance(token_tenant, str) or not token_tenant \
+                or isinstance(revision, bool) or not isinstance(revision, int) \
+                or revision < 0:
+            raise ObsError("invalid read token")
+        if not isinstance(tenant, str) or token_tenant != tenant:
+            raise ObsError("invalid read token")
+        with self._lock:
+            self._refresh_revision()
+            current = self._revision
+        if revision > current:
+            raise ObsError("read revision unavailable")
+        return revision
+
+    @staticmethod
+    def _clean_return_revision(return_revision):
+        """``return_revision`` must be a real boolean (an explicit null is
+        rejected, not treated as ``False``); checked before any state change."""
+        if not isinstance(return_revision, bool):
+            raise ObsError("return_revision must be a boolean")
+        return return_revision
 
     # ------------------------------------------------------------------ quotas
     def _load_quotas(self):
@@ -377,7 +553,8 @@ class SeriesStore:
                     "max_points": limits["max_points"], "series": series, "points": points}
 
     # ------------------------------------------------------------------- write
-    def write(self, tenant, metric, labels, samples, now=None, overwrite=False):
+    def write(self, tenant, metric, labels, samples, now=None, overwrite=False,
+              return_revision=False):
         """Store ``samples`` = ``[(timestamp_ms, value), ...]``.
 
         Idempotent: an identical ``(series, timestamp)`` value is a duplicate
@@ -385,9 +562,9 @@ class SeriesStore:
         ``ObsError`` unless ``overwrite=True``.
 
         ``now`` is ``None`` (no future check) or a non-boolean integer;
-        ``overwrite`` must be a boolean. Anything else raises ``ObsError``
-        before any validation or state change: no series, points, write
-        counter, quota usage or temp file is touched.
+        ``overwrite`` and ``return_revision`` must be booleans. Anything else
+        raises ``ObsError`` before any validation or state change: no series,
+        points, write counter, quota usage, revision or temp file is touched.
 
         The whole batch is checked against the tenant's configured quotas
         *after* input validation and conflict rules, using the net new series
@@ -395,17 +572,24 @@ class SeriesStore:
         overwrites and timestamps repeated inside the batch add nothing). A
         batch that would exceed either limit is rejected wholesale with
         ``ObsError``: no series, points or write counter change is kept.
+
+        A write that stores anything increases the persistent revision by
+        one; a pure-duplicate write does not. With ``return_revision=True``
+        the result carries ``revision``: the commit revision when something
+        was written, otherwise the current revision.
         """
         if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
             raise ObsError("now must be a non-boolean integer timestamp in ms or None")
         if not isinstance(overwrite, bool):
             raise ObsError("overwrite must be a boolean")
+        self._clean_return_revision(return_revision)
         clean = _clean_samples(samples, now)
         # Labels/tenant are validated before the lock so conflicts and quota
         # breaches never surface as identity errors.
         pairs = _labels_list(labels)
         identity = canonical_identity(tenant, metric, pairs)
         sid = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        revision = None
         with self._lock:
             existed = sid in self._series
             current = dict(self._samples.get(sid, ()))
@@ -469,10 +653,15 @@ class SeriesStore:
                         handle.flush()
                         os.fsync(handle.fileno())
                 self._writes += 1
+                revision = self._bump_revision()
                 self._save_registry()
-        return {"series_id": sid, "written": written, "duplicates": duplicates}
+        result = {"series_id": sid, "written": written, "duplicates": duplicates}
+        if return_revision:
+            result["revision"] = revision if revision is not None \
+                else self._revision_now()
+        return result
 
-    def write_batch(self, entries, now=None, overwrite=False):
+    def write_batch(self, entries, now=None, overwrite=False, return_revision=False):
         """Atomically store many series' samples in one all-or-nothing batch.
 
         ``entries`` is a non-empty list of objects, each with exactly the
@@ -492,16 +681,22 @@ class SeriesStore:
         no occupancy, and only dimensions that actually increase are checked.
 
         Any rejection (structure, validation, future sample, conflict, quota)
-        raises ``ObsError`` and leaves no series, sample or write-count change
-        behind, on disk included. On success ``stats()["writes"]`` increases
-        by exactly one when the batch wrote anything; a pure-duplicate batch
+        raises ``ObsError`` and leaves no series, sample, write-count or
+        revision change behind, on disk included. On success
+        ``stats()["writes"]`` and the persistent revision each increase by
+        exactly one when the batch wrote anything; a pure-duplicate batch
         increases nothing. Returns ``{"written", "duplicates", "results"}``
         where ``results`` holds one ``{"series_id", "written", "duplicates"}``
-        per entry, in input order, and the totals are their sums.
+        per entry, in input order, and the totals are their sums. With
+        ``return_revision=True`` (a boolean; anything else is rejected before
+        any validation) the result also carries ``revision``: the commit
+        revision, or the current revision when nothing was committed.
         """
-        return self._apply_batch(entries, now=now, overwrite=overwrite, commit=True)
+        return self._apply_batch(entries, now=now, overwrite=overwrite,
+                                 commit=True, return_revision=return_revision)
 
-    def _apply_batch(self, entries, now=None, overwrite=False, commit=True):
+    def _apply_batch(self, entries, now=None, overwrite=False, commit=True,
+                     return_revision=False):
         """The ``write_batch`` machinery; ``commit=False`` only validates and counts.
 
         With ``commit=False`` every check runs exactly as for a real batch
@@ -514,6 +709,7 @@ class SeriesStore:
             raise ObsError("now must be a non-boolean integer timestamp in ms or None")
         if not isinstance(overwrite, bool):
             raise ObsError("overwrite must be a boolean")
+        self._clean_return_revision(return_revision)
         if not isinstance(entries, (list, tuple)) or not entries:
             raise ObsError("entries must be a non-empty list of entry objects")
         # Phase 1: validate every entry before any conflict or quota check, so
@@ -603,6 +799,7 @@ class SeriesStore:
                         % (tenant, used_points, new_points, limit_points))
             # Phase 4: commit. Everything before this point was in-memory
             # simulation, so a rejection above leaves no trace anywhere.
+            revision = None
             if commit and total_written:
                 committed = set()
                 for tenant, metric, pairs, identity, sid, clean in prepared:
@@ -631,13 +828,18 @@ class SeriesStore:
                             handle.flush()
                             os.fsync(handle.fileno())
                 self._writes += 1
+                revision = self._bump_revision()
                 self._save_registry()
-        return {"written": total_written, "duplicates": total_duplicates,
-                "results": results}
+        result = {"written": total_written, "duplicates": total_duplicates,
+                  "results": results}
+        if return_revision:
+            result["revision"] = revision if revision is not None \
+                else self._revision_now()
+        return result
 
     # ------------------------------------------------------------------ export
     def export_snapshot(self, tenant, metric, labels=None, start_ms=None,
-                        end_ms=None, matchers=None):
+                        end_ms=None, matchers=None, read_token=None):
         """A verifiable snapshot of the matching series' raw samples.
 
         Filters exactly like :meth:`query` (exact ``labels``, ``matchers`` and
@@ -652,9 +854,13 @@ class SeriesStore:
 
         The whole export reads one coherent snapshot under a single lock
         acquisition and never changes series, samples, write counters, quotas,
-        alerts or query results: exporting the same state twice yields
-        byte-identical content.
+        alerts, the revision or query results: exporting the same state twice
+        yields byte-identical content. With ``read_token`` given the token is
+        validated first (see :meth:`check_read_token`) and the export runs
+        only once this instance has reached the token's revision.
         """
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
         compiled_matchers = compile_matchers(matchers)
         lo = None if start_ms is None else int(start_ms)
         hi = None if end_ms is None else int(end_ms)
@@ -675,7 +881,7 @@ class SeriesStore:
 
     # ------------------------------------------------------------------ replay
     def replay_snapshot(self, snapshot, now_ms=None, overwrite=False,
-                        dry_run=False):
+                        dry_run=False, return_revision=False):
         """Validate and apply a snapshot produced by :meth:`export_snapshot`.
 
         The snapshot is verified before anything is stored: ``version`` must
@@ -693,12 +899,17 @@ class SeriesStore:
         commits and ``applied`` is ``True``. The result is ``{"written",
         "duplicates", "results", "applied"}`` with ``results`` in entry order.
         Replaying a snapshot onto the state it was exported from is a pure
-        duplicate replay (``written == 0``, the write counter does not move);
-        replaying onto a partial state fills in only the missing points. An
-        empty ``entries`` list is a valid no-op snapshot.
+        duplicate replay (``written == 0``, the write counter and the revision
+        do not move); replaying onto a partial state fills in only the missing
+        points. An empty ``entries`` list is a valid no-op snapshot. A real
+        replay that stores anything increases the persistent revision by one.
+        With ``return_revision=True`` (a boolean; anything else is rejected
+        before any validation) the result also carries ``revision``: the
+        commit revision, or the current revision when nothing was committed.
         """
         if not isinstance(dry_run, bool):
             raise ObsError("dry_run must be a boolean")
+        self._clean_return_revision(return_revision)
         if now_ms is not None and (isinstance(now_ms, bool)
                                    or not isinstance(now_ms, int)):
             raise ObsError("now_ms must be a non-boolean integer timestamp in ms or None")
@@ -721,12 +932,19 @@ class SeriesStore:
         if snapshot_id != digest:
             raise ObsError("snapshot_id does not match the entries digest")
         if not entries:
-            return {"written": 0, "duplicates": 0, "results": [],
-                    "applied": not dry_run}
+            result = {"written": 0, "duplicates": 0, "results": [],
+                      "applied": not dry_run}
+            if return_revision:
+                result["revision"] = self._revision_now()
+            return result
         result = self._apply_batch(entries, now=now_ms, overwrite=overwrite,
-                                   commit=not dry_run)
-        return {"written": result["written"], "duplicates": result["duplicates"],
-                "results": result["results"], "applied": not dry_run}
+                                   commit=not dry_run,
+                                   return_revision=return_revision)
+        out = {"written": result["written"], "duplicates": result["duplicates"],
+               "results": result["results"], "applied": not dry_run}
+        if return_revision:
+            out["revision"] = result["revision"]
+        return out
 
     # ------------------------------------------------------------------- query
     def _matching_series(self, tenant, metric, labels, compiled_matchers=()):
@@ -766,8 +984,16 @@ class SeriesStore:
         return out
 
     def query(self, tenant, metric, labels=None, start_ms=None, end_ms=None,
-              step_ms=None, agg=None, group_by=None, window_ms=None, matchers=None):
+              step_ms=None, agg=None, group_by=None, window_ms=None, matchers=None,
+              read_token=None):
         """Raw, bucketed or sliding-window points per matching series.
+
+        With ``read_token`` given the token is validated before anything else
+        (see :meth:`check_read_token`): a tampered, malformed or cross-tenant
+        token fails the query with ``ObsError`` (``400`` semantics), and a
+        token whose revision this instance has not reached yet fails with
+        ``ObsError`` (``409`` semantics). The query itself never changes the
+        revision and reads one coherent snapshot.
 
         ``matchers`` is an optional list of ``{"key", "op", "value"}`` objects
         (``None`` or ``[]`` adds no condition). Supported ops: ``=``, ``!=``
@@ -821,7 +1047,10 @@ class SeriesStore:
         """
         # Compile before anything else so all matchers are validated even when
         # another argument (or the absence of candidate series) would yield an
-        # empty result.
+        # empty result. The read token gates even that: an invalid or
+        # unavailable token rejects the read before any processing.
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
         compiled_matchers = compile_matchers(matchers)
         if agg is not None and agg not in AGGREGATES + COUNTER_AGGREGATES:
             raise ObsError("unknown aggregation: %r" % (agg,))
@@ -1155,7 +1384,8 @@ class SeriesStore:
             return True
         return sorted(rows.items()) != [tuple(item) for item in keep]
 
-    def run_retention(self, now_ms, tenant=None, dry_run=False):
+    def run_retention(self, now_ms, tenant=None, dry_run=False,
+                      return_revision=False):
         """Apply the configured retention policies as of ``now_ms``.
 
         ``now_ms`` must be a non-boolean integer. With ``tenant`` given only
@@ -1171,12 +1401,17 @@ class SeriesStore:
 
         The whole run is one atomic step: concurrent queries, quota and stats
         reads only ever see the complete state before or after it. With
-        ``dry_run=True`` the same report is produced but memory, files, quotas
-        and the write counter are left untouched. Returns
+        ``dry_run=True`` the same report is produced but memory, files, quotas,
+        the write counter and the revision are left untouched. A real run that
+        deletes at least one sample increases the persistent revision by one;
+        a run that deletes nothing does not. Returns
         ``{"dry_run": bool, "tenants": [...]}`` with one
         ``{"tenant", "cutoff_ms", "dropped", "affected_series",
         "remaining_points", "compacted_series"}`` entry per processed tenant,
-        in lexicographic tenant order.
+        in lexicographic tenant order. With ``return_revision=True`` (a
+        boolean; anything else is rejected before any validation) the result
+        also carries ``revision``: the commit revision, or the current
+        revision when nothing was committed.
         """
         if isinstance(now_ms, bool) or not isinstance(now_ms, int):
             raise ObsError("now_ms must be a non-boolean integer timestamp in ms")
@@ -1184,9 +1419,12 @@ class SeriesStore:
             tenant = self._clean_tenant(tenant)
         if not isinstance(dry_run, bool):
             raise ObsError("dry_run must be a boolean")
+        self._clean_return_revision(return_revision)
+        revision = None
         with self._lock:
             names = [tenant] if tenant is not None else sorted(self._retention)
             results = []
+            dropped_total = 0
             for name in names:
                 policy = self._retention.get(name)
                 sids = sorted(sid for sid, row in self._series.items()
@@ -1218,7 +1456,14 @@ class SeriesStore:
                                 "dropped": dropped, "affected_series": affected,
                                 "remaining_points": remaining,
                                 "compacted_series": compacted})
-            return {"dry_run": dry_run, "tenants": results}
+                dropped_total += dropped
+            if not dry_run and dropped_total:
+                revision = self._bump_revision()
+            result = {"dry_run": dry_run, "tenants": results}
+            if return_revision:
+                result["revision"] = revision if revision is not None \
+                    else self._revision_now()
+            return result
 
     def enforce_retention(self, tenant, cutoff_ms):
         """Drop every sample with ``timestamp_ms < cutoff_ms`` for ``tenant``."""
@@ -1235,6 +1480,8 @@ class SeriesStore:
                     self._rewrite_points(sid)
                     dropped += removed
                     affected += 1
+            if dropped:
+                self._bump_revision()
         return {"dropped": dropped, "series": affected, "cutoff_ms": cutoff}
 
     def stats(self):
