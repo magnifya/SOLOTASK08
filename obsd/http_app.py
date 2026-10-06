@@ -80,7 +80,7 @@ def _request_scope(engine, method, path, params, payload):
     record, or ``None``.
     """
     if method == "GET":
-        if path in ("/v1/query", "/v1/export"):
+        if path in ("/v1/query", "/v1/export", "/v1/consistency-token"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
                     "/v1/alerts", "/v1/slos", "/v1/slos/status"):
@@ -174,40 +174,55 @@ def dispatch(store, engine, method, path, params, payload, access=None):
     if (method, path) == ("GET", "/v1/retention/policies"):
         return 200, store.get_retention(_require(params, "tenant"))
     if (method, path) == ("POST", "/v1/retention/run"):
-        # ``dry_run`` passes through uncoerced: the store accepts only real
-        # booleans, just like ``now_ms`` accepts only non-bool integers.
-        _only(payload, {"tenant", "now_ms", "dry_run"})
+        # ``dry_run``/``return_revision`` pass through uncoerced: the store
+        # accepts only real booleans, just like ``now_ms`` accepts only
+        # non-bool integers.
+        _only(payload, {"tenant", "now_ms", "dry_run", "return_revision"})
         return 200, store.run_retention(_require(payload, "now_ms"),
                                         tenant=payload.get("tenant"),
-                                        dry_run=payload.get("dry_run", False))
+                                        dry_run=payload.get("dry_run", False),
+                                        return_revision=payload.get("return_revision", False))
     if (method, path) == ("POST", "/v1/series"):
-        # ``now_ms`` and ``overwrite`` pass through uncoerced: the store
-        # accepts only None or a non-bool integer for ``now_ms`` and only real
-        # booleans for ``overwrite`` (omitted defaults to False; an explicit
-        # null is rejected, not treated as False).
+        # ``now_ms``, ``overwrite`` and ``return_revision`` pass through
+        # uncoerced: the store accepts only None or a non-bool integer for
+        # ``now_ms`` and only real booleans for the flags (omitted defaults to
+        # False; an explicit null is rejected, not treated as False).
         result = store.write(_require(payload, "tenant"), _require(payload, "metric"),
                              _labels(payload), _require(payload, "samples"),
                              now=payload.get("now_ms"),
-                             overwrite=payload.get("overwrite", False))
-        return 202, {"written": result["written"], "duplicates": result["duplicates"],
-                     "series_id": result["series_id"]}
+                             overwrite=payload.get("overwrite", False),
+                             return_revision=payload.get("return_revision", False))
+        body = {"written": result["written"], "duplicates": result["duplicates"],
+                "series_id": result["series_id"]}
+        if "revision" in result:
+            body["revision"] = result["revision"]
+        return 202, body
     if (method, path) == ("POST", "/v1/series/batch"):
-        # ``overwrite`` is passed through uncoerced: the store accepts only
-        # real booleans, just like ``now_ms`` accepts only non-bool integers.
+        # ``overwrite``/``return_revision`` are passed through uncoerced: the
+        # store accepts only real booleans, just like ``now_ms`` accepts only
+        # non-bool integers.
         result = store.write_batch(_require(payload, "entries"),
                                    now=payload.get("now_ms"),
-                                   overwrite=payload.get("overwrite", False))
-        return 202, {"written": result["written"], "duplicates": result["duplicates"],
-                     "results": result["results"]}
+                                   overwrite=payload.get("overwrite", False),
+                                   return_revision=payload.get("return_revision", False))
+        body = {"written": result["written"], "duplicates": result["duplicates"],
+                "results": result["results"]}
+        if "revision" in result:
+            body["revision"] = result["revision"]
+        return 202, body
     if (method, path) == ("POST", "/v1/replay"):
         # The snapshot travels in the body together with the replay options;
-        # ``overwrite``/``dry_run`` pass through uncoerced (booleans only).
+        # ``overwrite``/``dry_run``/``return_revision`` pass through uncoerced
+        # (booleans only).
         snapshot = {key: payload[key]
                     for key in ("version", "snapshot_id", "entries") if key in payload}
         result = store.replay_snapshot(snapshot, now_ms=payload.get("now_ms"),
                                        overwrite=payload.get("overwrite", False),
-                                       dry_run=payload.get("dry_run", False))
+                                       dry_run=payload.get("dry_run", False),
+                                       return_revision=payload.get("return_revision", False))
         return (202 if result["applied"] else 200), result
+    if (method, path) == ("GET", "/v1/consistency-token"):
+        return 200, store.consistency_token(_require(params, "tenant"))
     if (method, path) == ("GET", "/v1/query"):
         rows = store.query(_require(params, "tenant"), _require(params, "metric"), labels=labels,
                            start_ms=_int(params.get("start"), "start"),
@@ -216,7 +231,8 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                            agg=params.get("agg") or None,
                            group_by=_group_by(params.get("group_by")),
                            window_ms=_int(params.get("window"), "window"),
-                           matchers=parse_matchers_text(params.get("matchers")))
+                           matchers=parse_matchers_text(params.get("matchers")),
+                           read_token=params.get("read_token"))
         return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
                                 for row in rows]}
     if (method, path) == ("GET", "/v1/export"):
@@ -224,7 +240,8 @@ def dispatch(store, engine, method, path, params, payload, access=None):
             _require(params, "tenant"), _require(params, "metric"), labels=labels,
             start_ms=_int(params.get("start"), "start"),
             end_ms=_int(params.get("end"), "end"),
-            matchers=parse_matchers_text(params.get("matchers")))
+            matchers=parse_matchers_text(params.get("matchers")),
+            read_token=params.get("read_token"))
     if (method, path) == ("POST", "/v1/rules"):
         return 201, engine.add_rule(payload)
     if (method, path) == ("GET", "/v1/rules"):
@@ -272,7 +289,9 @@ def dispatch(store, engine, method, path, params, payload, access=None):
         return 200, {"slos": engine.list_slos(params.get("tenant"))}
     if (method, path) == ("GET", "/v1/slos/status"):
         now = _int(params.get("now_ms"), "now_ms", int(time.time() * 1000))
-        return 200, engine.slo_status(_require(params, "name"), now, tenant=params.get("tenant"))
+        return 200, engine.slo_status(_require(params, "name"), now,
+                                      tenant=params.get("tenant"),
+                                      read_token=params.get("read_token"))
     raise ObsError("not found: %s %s" % (method, path))
 def _status_for(message):
     if message.startswith("not found"):
@@ -281,7 +300,9 @@ def _status_for(message):
     # unknown aggregation is a malformed request (400).
     if message.startswith("unknown") and not message.startswith("unknown aggregation"):
         return 404
-    return 409 if message.startswith(("conflict", "quota exceeded")) else 400
+    if message.startswith(("conflict", "quota exceeded", "read revision unavailable")):
+        return 409
+    return 400
 def make_handler(store, engine, access=None):
     class ObsdHandler(BaseHTTPRequestHandler):
         server_version = "obsd/0.1"

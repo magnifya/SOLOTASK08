@@ -38,15 +38,16 @@ stderr and exits non-zero.
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
 | `retention-set` | `python3 -m obsd retention-set --tenant acme --retention-ms 86400000` (omit `--retention-ms` for no cleanup) |
 | `retention-get` | `python3 -m obsd retention-get --tenant acme` |
-| `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run]` |
-| `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
-| `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000` |
+| `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run] [--return-revision]` |
+| `consistency-token` | `python3 -m obsd consistency-token --tenant acme` |
+| `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000 [--return-revision]` |
+| `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000 [--return-revision]` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
 | `query` (grouped) | `python3 -m obsd query --tenant acme --metric latency_ms --agg avg --group-by '["host"]'` |
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
 | `export` | `python3 -m obsd export --tenant acme --metric latency_ms --start 0 --end 5000` |
-| `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000` |
+| `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000 [--return-revision]` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
 | `alerts` | `python3 -m obsd alerts --tenant acme --state firing` |
@@ -69,16 +70,17 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
-| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `400` on malformed input or a non-boolean `now_ms`/`overwrite` (an explicit `null` `overwrite` is rejected, not treated as `false`), `409` on conflicting timestamp or quota exceeded |
-| POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}`, `400` on malformed entries, `409` on conflict or quota exceeded |
-| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
-| GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}` |
-| POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
+| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...],"now_ms"?,"overwrite"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `400` on malformed input or a non-boolean `now_ms`/`overwrite`/`return_revision` (an explicit `null` is rejected, not treated as `false`), `409` on conflicting timestamp or quota exceeded |
+| POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}`, `400` on malformed entries, `409` on conflict or quota exceeded |
+| GET | `/v1/consistency-token` | `?tenant=` | `200 {"tenant","token","revision"}` |
+| GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=&read_token=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
+| GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=&read_token=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}` |
+| POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
 | POST | `/v1/retention/policies` | `{"tenant","retention_ms":n\|null}` | `200 {"tenant","retention_ms","series","points"}`; invalid tenant/policy or unknown fields give `400` and leave config untouched |
 | GET | `/v1/retention/policies` | `?tenant=` | `200 {"tenant","retention_ms","series","points"}` (unconfigured tenant reports a `null` policy and real usage) |
-| POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}`; missing/non-integer `now_ms`, non-boolean `dry_run` or unknown fields give `400` |
+| POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?,"return_revision"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}`; missing/non-integer `now_ms`, non-boolean `dry_run`/`return_revision` or unknown fields give `400` |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -91,7 +93,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | GET | `/v1/notifications` | `?tenant=&route_id=&alert_id=&acked=` | `200 {"notifications":[...]}` (read-only, never consumes) |
 | POST | `/v1/notifications/{id}/ack` | – | `200` stored notification (re-ack returns the same record); `404` unknown notification |
 | POST | `/v1/slos` | `{"tenant","name","metric","labels","good_comparator","threshold","target_ratio","window_ms"}` | `201` stored SLO |
-| GET | `/v1/slos/status` | `?tenant=&name=&now_ms=` | `200` SLO status object |
+| GET | `/v1/slos/status` | `?tenant=&name=&now_ms=&read_token=` | `200` SLO status object |
 | GET | `/v1/stats` | – | `200 {"store":{...},"alerts":n}` |
 | GET | `/v1/audit` | `?tenant=&principal_id=&outcome=&after_seq=&limit=` | `200 {"entries":[{"seq","principal_id","method","path","tenant","outcome","status"},...]}` ascending by `seq` (admin only) |
 
@@ -133,6 +135,37 @@ startup, so records and the `seq` sequence survive restarts.
 and `after_seq` (entries with `seq > after_seq`) and pages with a positive
 integer `limit`; invalid filters are `400`, non-admin access is `403`.
 
+**Revisions and consistent reads.** The store keeps a persistent commit
+counter (`revision.json`): every successful single write, batch write,
+snapshot replay or retention run that actually changes stored samples advances
+it by exactly one, while pure duplicates, dry runs, validation failures,
+conflicts, quota rejections and retention runs that delete nothing leave it
+untouched. The counter survives restarts and is never moved by queries,
+exports or SLO status reads; a failed batch or replay leaves neither data nor
+numbering behind, and concurrent reads only ever see the complete state
+before or after a commit.
+
+`GET /v1/consistency-token?tenant=` (CLI: `consistency-token --tenant`)
+issues a tenant-bound read token at the current revision:
+`{"tenant","token","revision"}`. The token is HMAC-signed with a persisted
+key, so it stays verifiable across restarts. The write, batch, replay and
+retention-run entries accept an optional `return_revision` flag (CLI:
+`--return-revision`; strictly boolean — an explicit `null` or any other type
+is `400` and changes nothing): when set, the result gains a `revision` field
+with the commit's revision, or the current revision when nothing was
+committed; when omitted, the result keeps its original shape.
+
+`query`, `export` and `slo status` accept an optional `read_token` (CLI:
+`--read-token`). The read is only processed once the instance has reached the
+token's revision, and then runs as one consistent snapshot; later reads with
+the same token may see newer versions, never older ones. A malformed,
+tampered, foreign-tenant or cross-tenant token is rejected with
+`400 {"error":"invalid read token"}`; a valid token whose revision the
+instance has not reached yet is rejected with
+`409 {"error":"read revision unavailable"}`. Token endpoints follow the
+ordinary access rules: a principal may only create and use tokens for tenants
+in its scope, and everything stays anonymous while no `access.json` exists.
+
 ## Data model
 
 A series identity is `(tenant, metric, sorted(label pairs))`. The canonical
@@ -153,6 +186,7 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/points/<series_id>.jsonl one {"t":ts,"v":value} object per line
 <data-dir>/quotas.json              tenant -> {"max_series","max_points"} limits
 <data-dir>/retention.json           tenant -> {"retention_ms"} retention policies
+<data-dir>/revision.json            {"revision","token_key"} commit counter + token key
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
