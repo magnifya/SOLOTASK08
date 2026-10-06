@@ -39,6 +39,10 @@ stderr and exits non-zero.
 | `retention-set` | `python3 -m obsd retention-set --tenant acme --retention-ms 86400000` (omit `--retention-ms` for no cleanup) |
 | `retention-get` | `python3 -m obsd retention-get --tenant acme` |
 | `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run] [--return-revision]` |
+| `downsampling-set` | `python3 -m obsd downsampling-set --tenant acme --metric latency_ms --step-ms 60000 --agg sum --agg avg` |
+| `downsampling-get` | `python3 -m obsd downsampling-get --tenant acme --metric latency_ms` |
+| `downsampling-run` | `python3 -m obsd downsampling-run --now-ms 2000 [--tenant acme] [--metric latency_ms] [--dry-run] [--return-revision]` |
+| `downsampled-query` | `python3 -m obsd downsampled-query --tenant acme --metric latency_ms --start 0 --end 5000 --agg avg [--read-token T]` |
 | `consistency-token` | `python3 -m obsd consistency-token --tenant acme` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000 [--return-revision]` |
 | `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000 [--return-revision]` |
@@ -82,6 +86,10 @@ conflict, quota exceeded or `read revision unavailable`).
 | POST | `/v1/retention/policies` | `{"tenant","retention_ms":n\|null}` | `200 {"tenant","retention_ms","series","points"}`; invalid tenant/policy or unknown fields give `400` and leave config untouched |
 | GET | `/v1/retention/policies` | `?tenant=` | `200 {"tenant","retention_ms","series","points"}` (unconfigured tenant reports a `null` policy and real usage) |
 | POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?,"return_revision"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}` (plus `"revision"` when `return_revision` is true); missing/non-integer `now_ms`, non-boolean `dry_run`/`return_revision` or unknown fields give `400` |
+| POST | `/v1/downsampling/policies` | `{"tenant","metric","step_ms":n,"aggregations":["sum",...]}` | `200 {"tenant","metric","step_ms","aggregations"}` — creates or replaces the policy (replacement keeps raw samples, clears old results); any invalid field or unknown key gives `400 {"error":"downsampling policy invalid"}` |
+| GET | `/v1/downsampling/policies` | `?tenant=&metric=` | `200 {"tenant","metric","step_ms","aggregations"}` (unconfigured policy reports `null` fields) |
+| POST | `/v1/downsampling/run` | `{"now_ms":n,"tenant"?,"metric"?,"dry_run"?,"return_revision"?}` | `200 {"dry_run":b,"policies":[{"tenant","metric","buckets","changed"},...]}` (plus `"revision"` when `return_revision` is true); any invalid argument gives `400 {"error":"downsampling run invalid"}` |
+| GET | `/v1/query/downsampled` | `?tenant=&metric=&label.k=v&matchers=&start=&end=&agg=&read_token=` (step fixed by the policy) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}`, `404 {"error":"downsampling policy unavailable"}` with no policy, `400 {"error":"downsampling aggregation unavailable"}` for an undeclared `agg`, `400 {"error":"downsampled query unsupported"}` for windows/grouping/counter aggregates, `400`/`409` on read-token failures |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -164,6 +172,8 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/access.json              principals: id, token SHA-256 digest, role, tenants
 <data-dir>/audit.jsonl              one audit record per line, seq monotonically increasing
 <data-dir>/revision.json            persistent revision counter + token-signing secret
+<data-dir>/downsampling.json        (tenant, metric) downsampling policies
+<data-dir>/downsampled/<sid>.json   persisted downsampled buckets per series
 ```
 
 A directory written before quotas existed simply has no `quotas.json`, which
@@ -387,6 +397,48 @@ Policies and sweep results survive a restart. With access control enabled,
 reading a policy is a tenant-scoped `read`, setting a policy and running a
 single-tenant sweep are tenant-scoped `write`s, a sweep across every
 configured tenant is admin-only, and all of them are audited.
+
+**Persistent downsampling.** `set_downsampling_policy(tenant, metric, step_ms,
+aggregations)` (also `POST /v1/downsampling/policies` and the CLI
+`downsampling-set`) creates or replaces the per-(tenant, metric) policy:
+`step_ms` is a positive integer bucket resolution and `aggregations` a
+non-empty list of distinct entries from `sum`, `avg`, `min`, `max`, `count`;
+anything else is rejected with `downsampling policy invalid` (`400`) and
+leaves the persisted config untouched. Replacing a policy keeps the raw
+samples but clears the previously computed results of that (tenant, metric).
+`get_downsampling_policy(tenant, metric)` (also `GET
+/v1/downsampling/policies` and `downsampling-get`) returns the normalised
+policy, with `null` fields when unconfigured.
+
+`run_downsampling(now_ms, tenant=None, metric=None, dry_run=False)` (also
+`POST /v1/downsampling/run` and `downsampling-run`) recomputes persisted
+buckets from the raw samples with `timestamp_ms <= now_ms` (`now_ms` is a
+required non-boolean integer; any invalid argument is `downsampling run
+invalid`, `400`). With `tenant`/`metric` given only the matching policies
+run, otherwise every configured policy runs in (tenant, metric) order.
+Bucketing uses the same epoch-aligned left-closed buckets and aggregation
+meanings as `query`; every bucket holding at least one processed sample is
+recomputed for each declared aggregation, so a repeated run recomputes
+exactly the affected buckets while buckets whose raw samples were cleaned by
+retention keep their stored values — retention only ever drops raw points.
+The result is `{"dry_run","policies":[{"tenant","metric","buckets",
+"changed"},...]}` (`buckets` recomputed, `changed` actually differing). A dry
+run changes neither data nor the revision; a real run is one atomic commit
+and increases the persistent revision exactly once when at least one bucket
+changed. Results are persisted under `downsampled/` and survive restarts.
+
+`query_downsampled(tenant, metric, ...)` (also `GET /v1/query/downsampled`
+and `downsampled-query`) reads the persisted buckets with the step fixed to
+the policy's `step_ms` and the same interval, bucket-start, null-filled empty
+bucket, ordering and matcher semantics as `query`. With no policy configured
+the read fails with `downsampling policy unavailable` (`404`); an `agg` the
+policy does not declare fails with `downsampling aggregation unavailable`
+(`400`); sliding windows, grouping and the counter aggregates are
+`downsampled query unsupported` (`400`). `read_token` reuses the ordinary
+read-consistency errors. With access control enabled the downsampled read is
+a tenant-scoped `read`, policy modification and a single-tenant run are
+tenant-scoped `write`s, a run across every configured policy is admin-only,
+and all of them are audited; raw write/query behaviour is unchanged.
 
 **Per-tenant quotas.** `set_quota(tenant, max_series, max_points)` sets the
 tenant-wide limits; each limit is a non-negative integer or `null` (omitted
@@ -631,6 +683,12 @@ restart and multi-instance continuity) with `return_revision` on every write
 path, and read-consistency tokens (minting, tamper/cross-tenant/foreign
 rejection, unavailable-revision `409`s, monotonic re-reads, restart
 verifiability, and the HTTP/CLI surfaces with access control and audit),
+persistent downsampling (policy set/get/validation and persistence,
+replacement clearing results but keeping raw samples, runs with epoch-bucket
+recomputation, dry runs, single revision bumps, tenant/metric filtering,
+restart and retention survival, downsampled queries with null-filled buckets,
+matcher/label filtering, the unavailable/unsupported error shapes, and the
+HTTP/CLI surfaces with role scoping and audit),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

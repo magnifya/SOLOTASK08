@@ -96,6 +96,48 @@ def _build_parser():
     retention_run.add_argument("--return-revision", action="store_true",
                                help="include the commit revision in the result")
 
+    ds_set = sub.add_parser("downsampling-set",
+                            help="create or replace a tenant/metric "
+                                 "downsampling policy")
+    ds_set.add_argument("--tenant", required=True)
+    ds_set.add_argument("--metric", required=True)
+    ds_set.add_argument("--step-ms", type=int, required=True,
+                        help="fixed bucket resolution in ms (positive integer)")
+    ds_set.add_argument("--agg", action="append", required=True, choices=AGGS,
+                        help="declare an aggregation; repeat for several")
+
+    ds_get = sub.add_parser("downsampling-get",
+                            help="show a tenant/metric downsampling policy")
+    ds_get.add_argument("--tenant", required=True)
+    ds_get.add_argument("--metric", required=True)
+
+    ds_run = sub.add_parser("downsampling-run",
+                            help="(re)compute persisted downsampled buckets "
+                                 "for one policy or every configured policy")
+    ds_run.add_argument("--tenant", default=None,
+                        help="process only this tenant's policies")
+    ds_run.add_argument("--metric", default=None,
+                        help="process only policies for this metric")
+    ds_run.add_argument("--now-ms", type=int, required=True,
+                        help="process raw samples up to and including this ms")
+    ds_run.add_argument("--dry-run", action="store_true",
+                        help="report only; nothing is stored and the revision "
+                             "does not move")
+    ds_run.add_argument("--return-revision", action="store_true",
+                        help="include the commit revision in the result")
+
+    ds_query = _common(sub.add_parser("downsampled-query",
+                                      help="query persisted downsampled buckets "
+                                           "(step fixed by the policy)"))
+    ds_query.add_argument("--start", type=int, default=None)
+    ds_query.add_argument("--end", type=int, default=None)
+    ds_query.add_argument("--agg", choices=QUERY_AGGS, default=None)
+    ds_query.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                          help='JSON array of {"key","op","value"} matchers; '
+                               'op is one of =, !=, =~, !~ (AND with --label)')
+    ds_query.add_argument("--read-token", default=None,
+                          help="consistency token the read must catch up to")
+
     consistency_token = sub.add_parser("consistency-token",
                                        help="mint a read-consistency token for a tenant")
     consistency_token.add_argument("--tenant", required=True)
@@ -257,6 +299,24 @@ def _run(args, store, engine, access):
         _emit(store.run_retention(args.now_ms, tenant=args.tenant,
                                   dry_run=args.dry_run,
                                   return_revision=args.return_revision))
+    elif args.command == "downsampling-set":
+        _emit(store.set_downsampling_policy(args.tenant, args.metric,
+                                            args.step_ms, args.agg))
+    elif args.command == "downsampling-get":
+        _emit(store.get_downsampling_policy(args.tenant, args.metric))
+    elif args.command == "downsampling-run":
+        _emit(store.run_downsampling(args.now_ms, tenant=args.tenant,
+                                     metric=args.metric, dry_run=args.dry_run,
+                                     return_revision=args.return_revision))
+    elif args.command == "downsampled-query":
+        matchers = parse_matchers_text(args.matchers, "--matchers")
+        rows = store.query_downsampled(args.tenant, args.metric,
+                                       labels=_labels(args.label),
+                                       start_ms=args.start, end_ms=args.end,
+                                       agg=args.agg, matchers=matchers,
+                                       read_token=args.read_token)
+        _emit({"series": [{"labels": row["labels"], "points": row["points"]}
+                          for row in rows]})
     elif args.command == "consistency-token":
         _emit(store.consistency_token(args.tenant))
     elif args.command == "write":
