@@ -39,6 +39,10 @@ stderr and exits non-zero.
 | `retention-set` | `python3 -m obsd retention-set --tenant acme --retention-ms 86400000` (omit `--retention-ms` for no cleanup) |
 | `retention-get` | `python3 -m obsd retention-get --tenant acme` |
 | `retention-run` | `python3 -m obsd retention-run --now-ms 2000 [--tenant acme] [--dry-run] [--return-revision]` |
+| `downsampling-set` | `python3 -m obsd downsampling-set --tenant acme --metric latency_ms --step-ms 60000 --agg sum --agg avg` |
+| `downsampling-get` | `python3 -m obsd downsampling-get --tenant acme --metric latency_ms` |
+| `downsampling-run` | `python3 -m obsd downsampling-run --now-ms 2000 [--tenant acme] [--metric latency_ms] [--dry-run]` |
+| `downsampled-query` | `python3 -m obsd downsampled-query --tenant acme --metric latency_ms --start 0 --end 5000 --agg avg [--read-token T]` |
 | `consistency-token` | `python3 -m obsd consistency-token --tenant acme` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000 [--return-revision]` |
 | `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000 [--return-revision]` |
@@ -82,6 +86,10 @@ conflict, quota exceeded or `read revision unavailable`).
 | POST | `/v1/retention/policies` | `{"tenant","retention_ms":n\|null}` | `200 {"tenant","retention_ms","series","points"}`; invalid tenant/policy or unknown fields give `400` and leave config untouched |
 | GET | `/v1/retention/policies` | `?tenant=` | `200 {"tenant","retention_ms","series","points"}` (unconfigured tenant reports a `null` policy and real usage) |
 | POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?,"return_revision"?}` | `200 {"dry_run":b,"tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}` (plus `"revision"` when `return_revision` is true); missing/non-integer `now_ms`, non-boolean `dry_run`/`return_revision` or unknown fields give `400` |
+| POST | `/v1/downsampling/policies` | `{"tenant","metric","step_ms","aggregations":[...]}` | `200 {"tenant","metric","step_ms","aggregations"}` — creates or replaces the policy; any invalid field or unknown field gives `400 downsampling policy invalid`; replacing a different policy keeps the raw samples and clears the old downsampled results |
+| GET | `/v1/downsampling/policies` | `?tenant=&metric=` | `200 {"tenant","metric","step_ms","aggregations"}`; `404 downsampling policy unavailable` when no policy exists |
+| POST | `/v1/downsampling/run` | `{"now_ms":n,"tenant"?,"metric"?,"dry_run"?}` | `200 {"dry_run":b,"policies":[{"tenant","metric","step_ms","buckets","changed"},...]}`; a missing/non-integer `now_ms`, a non-boolean `dry_run`, bad filters or unknown fields give `400 downsampling run invalid` |
+| GET | `/v1/query/downsampled` | `?tenant=&metric=&label.k=v&start=&end=&agg=&matchers=&read_token=` | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` with the step fixed to the policy's `step_ms`; `404 downsampling policy unavailable` without a policy, `400 downsampling aggregation unavailable` for an aggregation the policy does not declare, `400 downsampled query unsupported` for `window`/`group_by`/counter aggregations, `400`/`409` on read-token failures |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -156,6 +164,8 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/points/<series_id>.jsonl one {"t":ts,"v":value} object per line
 <data-dir>/quotas.json              tenant -> {"max_series","max_points"} limits
 <data-dir>/retention.json           tenant -> {"retention_ms"} retention policies
+<data-dir>/downsampling.json        tenant -> metric -> {"step_ms","aggregations"}
+<data-dir>/downsampled/<digest>.json precomputed buckets of one downsampling policy
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
@@ -388,6 +398,56 @@ reading a policy is a tenant-scoped `read`, setting a policy and running a
 single-tenant sweep are tenant-scoped `write`s, a sweep across every
 configured tenant is admin-only, and all of them are audited.
 
+**Downsampling.** `set_downsampling_policy(tenant, metric, step_ms,
+aggregations)` (also `POST /v1/downsampling/policies` and the CLI
+`downsampling-set`) creates or replaces the persistent downsampling policy of
+one `(tenant, metric)` pair; `step_ms` is a positive integer bucket width and
+`aggregations` a non-empty, duplicate-free subset of `sum`, `avg`, `min`,
+`max`, `count` (stored in canonical order). Every invalid shape fails with
+`downsampling policy invalid` (`400`) and leaves the persisted config
+untouched. Replacing a policy with a different one keeps the raw samples but
+clears the policy's old downsampled results; restating the identical policy
+keeps them. `get_downsampling_policy(tenant, metric)` (also `GET
+/v1/downsampling/policies` and `downsampling-get`) returns the stored policy
+and fails with `downsampling policy unavailable` (`404`) when none exists.
+
+`run_downsampling(now_ms, tenant=None, metric=None, dry_run=False)` (also
+`POST /v1/downsampling/run` and `downsampling-run`) (re)computes downsampled
+buckets from the raw samples with `timestamp_ms <= now_ms` (`now_ms` is a
+required non-boolean integer; `tenant`/`metric` are optional filters, and
+with both omitted every configured policy is processed in lexicographic
+order — any other argument shape fails with `downsampling run invalid`,
+`400`). Bucketing and aggregation follow `query` exactly: epoch-aligned
+left-closed buckets of `step_ms`, one value per declared aggregation.
+Re-running recomputes the affected buckets and upserts them; buckets whose
+raw samples are gone (e.g. after a retention sweep) are left untouched —
+retention only ever removes raw points, so the downsampled history survives
+the raw data it was computed from. The report is `{"dry_run",
+"policies":[{"tenant","metric","step_ms","buckets","changed"},...]}` with
+`buckets` the buckets recomputed from raw samples and `changed` how many of
+them actually differ from the stored results. A dry run reports the same
+numbers without touching memory, files or the revision; a real run is one
+atomic commit and increases the persistent revision exactly once when at
+least one bucket changed, and not at all when nothing changed. Policies and
+results survive restarts.
+
+`query_downsampled(tenant, metric, ...)` (also `GET /v1/query/downsampled`
+and `downsampled-query`) reads the precomputed buckets with the step fixed to
+the policy's `step_ms`: interval handling, epoch-aligned bucket starts,
+`null`-filled empty buckets, series ordering and the exact-label/matcher
+filtering all follow the bucketed `query` semantics (a bucket takes part when
+its start lies inside the closed `[start, end]` interval; a matching series
+with no bucket in range is omitted). Without a policy the query fails with
+`downsampling policy unavailable` (`404`); an `agg` the policy does not
+declare fails with `downsampling aggregation unavailable` (`400`); sliding
+windows, grouping and the counter aggregates fail with `downsampled query
+unsupported` (`400`); `read_token` is validated exactly like `query`
+(`invalid read token` / `read revision unavailable`). With access control
+enabled the downsampled query and reading a policy are tenant-scoped
+`read`s, changing a policy and a single-tenant run are tenant-scoped
+`write`s, a run across every policy is admin-only, and all of them are
+audited. Raw writes, queries and retention behave exactly as before.
+
 **Per-tenant quotas.** `set_quota(tenant, max_series, max_points)` sets the
 tenant-wide limits; each limit is a non-negative integer or `null` (omitted
 fields over HTTP also mean `null`, i.e. unlimited), and `0` forbids adding any.
@@ -529,8 +589,9 @@ the budget still unspent). 90 good + 10 bad with `target_ratio = 0.99` gives
 **Revisions and read consistency.** The store keeps one persistent,
 monotonically increasing *revision* in `revision.json`. Every successful
 commit that changes samples or the visible scope — a single write, a batch
-write, a snapshot replay or a retention run that actually drops samples —
-increases it exactly once. Pure duplicates, dry runs, validation failures,
+write, a snapshot replay, a retention run that actually drops samples or a
+downsampling run that changes at least one bucket — increases it exactly
+once. Pure duplicates, dry runs, validation failures,
 conflicts, quota rejections and retention runs that delete nothing do not
 move it, and neither do queries, exports or SLO status reads. The counter is
 reloaded on construction (and folded in from disk on demand), so numbering
@@ -631,6 +692,13 @@ restart and multi-instance continuity) with `return_revision` on every write
 path, and read-consistency tokens (minting, tamper/cross-tenant/foreign
 rejection, unavailable-revision `409`s, monotonic re-reads, restart
 verifiability, and the HTTP/CLI surfaces with access control and audit),
+persistent downsampling policies (validation, replace-clears-results,
+restart persistence), downsampling runs (query-identical bucketing, the
+`now_ms` cutoff, idempotent re-runs with change counting, dry runs, filtered
+and full sweeps, single revision bumps, results surviving restarts and
+retention sweeps) and downsampled queries (interval/null-fill/ordering/
+matcher semantics, the unavailable-policy `404`, undeclared-aggregation and
+unsupported-mode `400`s, read tokens, and the HTTP/CLI surfaces),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

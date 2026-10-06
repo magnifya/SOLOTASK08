@@ -87,6 +87,8 @@ def _request_scope(engine, method, path, params, payload):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path == "/v1/retention/policies":
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
+        if path in ("/v1/downsampling/policies", "/v1/query/downsampled"):
+            return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/quotas", "/v1/stats", "/v1/audit"):
             return "admin", None, None
     elif method == "POST":
@@ -112,6 +114,15 @@ def _request_scope(engine, method, path, params, payload):
             # With a tenant it is an ordinary tenant-scoped write; without one
             # it sweeps every configured tenant — a cross-tenant operation
             # only an admin may run (an empty scope set permits admins only).
+            tenant = payload.get("tenant")
+            return ("write", _tenant_set(tenant), _scope_tenant(tenant)) \
+                if tenant is not None else ("write", set(), None)
+        if path == "/v1/downsampling/policies":
+            return "write", _tenant_set(payload.get("tenant")), \
+                _scope_tenant(payload.get("tenant"))
+        if path == "/v1/downsampling/run":
+            # Same shape as a retention run: tenant-scoped write with a
+            # tenant, admin-only cross-tenant run without one.
             tenant = payload.get("tenant")
             return ("write", _tenant_set(tenant), _scope_tenant(tenant)) \
                 if tenant is not None else ("write", set(), None)
@@ -184,6 +195,44 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                                         tenant=payload.get("tenant"),
                                         dry_run=payload.get("dry_run", False),
                                         return_revision=payload.get("return_revision", False))
+    if (method, path) == ("POST", "/v1/downsampling/policies"):
+        # Every validation failure of a policy is the same 400 error; fields
+        # pass through uncoerced so the store judges their types.
+        for key in payload:
+            if key not in ("tenant", "metric", "step_ms", "aggregations"):
+                raise ObsError("downsampling policy invalid")
+        return 200, store.set_downsampling_policy(
+            payload.get("tenant"), payload.get("metric"),
+            payload.get("step_ms"), payload.get("aggregations"))
+    if (method, path) == ("GET", "/v1/downsampling/policies"):
+        return 200, store.get_downsampling_policy(_require(params, "tenant"),
+                                                  _require(params, "metric"))
+    if (method, path) == ("POST", "/v1/downsampling/run"):
+        # ``now_ms``/``tenant``/``metric``/``dry_run`` pass through uncoerced:
+        # the store accepts only a non-bool integer ``now_ms``, non-empty
+        # string filters and a real boolean ``dry_run``.
+        for key in payload:
+            if key not in ("now_ms", "tenant", "metric", "dry_run"):
+                raise ObsError("downsampling run invalid")
+        return 200, store.run_downsampling(payload.get("now_ms"),
+                                           tenant=payload.get("tenant"),
+                                           metric=payload.get("metric"),
+                                           dry_run=payload.get("dry_run", False))
+    if (method, path) == ("GET", "/v1/query/downsampled"):
+        # The step comes from the policy; sliding windows and grouping are
+        # rejected rather than silently ignored.
+        if params.get("window") not in (None, "") \
+                or params.get("group_by") not in (None, ""):
+            raise ObsError("downsampled query unsupported")
+        rows = store.query_downsampled(
+            _require(params, "tenant"), _require(params, "metric"), labels=labels,
+            start_ms=_int(params.get("start"), "start"),
+            end_ms=_int(params.get("end"), "end"),
+            agg=params.get("agg") or None,
+            matchers=parse_matchers_text(params.get("matchers")),
+            read_token=params.get("read_token"))
+        return 200, {"series": [{"labels": row["labels"], "points": row["points"]}
+                                for row in rows]}
     if (method, path) == ("POST", "/v1/series"):
         # ``now_ms``, ``overwrite`` and ``return_revision`` pass through
         # uncoerced: the store accepts only None or a non-bool integer for
@@ -295,6 +344,8 @@ def dispatch(store, engine, method, path, params, payload, access=None):
     raise ObsError("not found: %s %s" % (method, path))
 def _status_for(message):
     if message.startswith("not found"):
+        return 404
+    if message == "downsampling policy unavailable":
         return 404
     # Unknown rules/alerts/SLOs/comparators are missing resources (404); an
     # unknown aggregation is a malformed request (400).

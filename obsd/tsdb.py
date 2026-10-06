@@ -245,6 +245,8 @@ class SeriesStore:
         <root>/points/<series_id>.jsonl    one ``{"t":ts,"v":value}`` per line
         <root>/quotas.json                 tenant -> {"max_series", "max_points"}
         <root>/retention.json              tenant -> {"retention_ms"}
+        <root>/downsampling.json           tenant -> metric -> policy
+        <root>/downsampled/<digest>.json   precomputed buckets of one policy
     """
 
     def __init__(self, root):
@@ -256,17 +258,24 @@ class SeriesStore:
         self.quota_path = os.path.join(self.root, "quotas.json")
         self.retention_path = os.path.join(self.root, "retention.json")
         self.revision_path = os.path.join(self.root, "revision.json")
+        self.downsampling_path = os.path.join(self.root, "downsampling.json")
+        self.downsampled_dir = os.path.join(self.root, "downsampled")
         self._lock = threading.RLock()
         self._series, self._samples, self._writes = {}, {}, 0
         self._quotas = {}
         self._retention = {}
+        self._downsampling = {}
+        self._downsampled = {}
         self._revision = 0
         self._secret = None
         os.makedirs(self.points_dir, exist_ok=True)
+        os.makedirs(self.downsampled_dir, exist_ok=True)
         self._load()
         self._load_quotas()
         self._load_retention()
         self._load_revision()
+        self._load_downsampling()
+        self._load_downsampled()
 
     def _points_path(self, sid):
         return os.path.join(self.points_dir, sid + ".jsonl")
@@ -1483,6 +1492,317 @@ class SeriesStore:
             if dropped:
                 self._bump_revision()
         return {"dropped": dropped, "series": affected, "cutoff_ms": cutoff}
+
+    # ------------------------------------------------------------ downsampling
+    # Persistent downsampling policies live in ``downsampling.json`` keyed by
+    # tenant then metric; each policy's precomputed buckets live in one file
+    # under ``downsampled/`` named by the digest of the policy key. Retention
+    # only ever removes raw points, so downsampled results survive the cleanup
+    # of the raw samples they were computed from.
+    def _load_downsampling(self):
+        """Reload ``downsampling.json``; a missing file means no policies."""
+        if not os.path.exists(self.downsampling_path):
+            return
+        try:
+            with open(self.downsampling_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ObsError("cannot read downsampling config: %s" % exc)
+        if not isinstance(data, dict):
+            raise ObsError("cannot read downsampling config: root must be an object")
+        for tenant, metrics in data.items():
+            if not isinstance(tenant, str) or not tenant \
+                    or not isinstance(metrics, dict):
+                raise ObsError("cannot read downsampling config: malformed entry")
+            for metric, row in metrics.items():
+                if not isinstance(metric, str) or not metric \
+                        or not isinstance(row, dict):
+                    raise ObsError("cannot read downsampling config: malformed entry")
+                step = row.get("step_ms")
+                aggregations = row.get("aggregations")
+                if isinstance(step, bool) or not isinstance(step, int) or step <= 0:
+                    raise ObsError("cannot read downsampling config: malformed step_ms")
+                if not isinstance(aggregations, list) or not aggregations \
+                        or any(agg not in AGGREGATES for agg in aggregations):
+                    raise ObsError(
+                        "cannot read downsampling config: malformed aggregations")
+                self._downsampling[(tenant, metric)] = {
+                    "step_ms": step,
+                    "aggregations": [agg for agg in AGGREGATES if agg in aggregations]}
+
+    def _save_downsampling(self):
+        nested = {}
+        for (tenant, metric), policy in sorted(self._downsampling.items()):
+            nested.setdefault(tenant, {})[metric] = {
+                "step_ms": policy["step_ms"],
+                "aggregations": list(policy["aggregations"])}
+        _atomic_write(self.downsampling_path, json.dumps(
+            nested, sort_keys=True, separators=(",", ":")))
+
+    def _downsampled_path(self, tenant, metric):
+        digest = hashlib.sha256(
+            (tenant + "\n" + metric).encode("utf-8")).hexdigest()
+        return os.path.join(self.downsampled_dir, digest + ".json")
+
+    def _load_downsampled(self):
+        """Reload every policy's precomputed buckets; junk entries are skipped."""
+        for tenant, metric in list(self._downsampling):
+            path = self._downsampled_path(tenant, metric)
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            series = data.get("series") if isinstance(data, dict) else None
+            if not isinstance(series, dict):
+                continue
+            clean = {}
+            for sid, per_agg in series.items():
+                if not isinstance(per_agg, dict):
+                    continue
+                aggs = {}
+                for agg, buckets in per_agg.items():
+                    if agg not in AGGREGATES or not isinstance(buckets, dict):
+                        continue
+                    rows = {}
+                    for bucket, value in buckets.items():
+                        try:
+                            stamp = int(bucket)
+                        except (TypeError, ValueError):
+                            continue
+                        if _num(value):
+                            rows[stamp] = value
+                    if rows:
+                        aggs[agg] = rows
+                if aggs:
+                    clean[sid] = aggs
+            if clean:
+                self._downsampled[(tenant, metric)] = clean
+
+    def _save_downsampled(self, tenant, metric):
+        series = self._downsampled.get((tenant, metric), {})
+        document = {
+            "tenant": tenant, "metric": metric,
+            "series": {sid: {agg: {str(bucket): value
+                                   for bucket, value in sorted(buckets.items())}
+                             for agg, buckets in sorted(per_agg.items())}
+                       for sid, per_agg in sorted(series.items())}}
+        _atomic_write(self._downsampled_path(tenant, metric),
+                      json.dumps(document, sort_keys=True, separators=(",", ":")))
+
+    @staticmethod
+    def _clean_downsampling_policy(tenant, metric, step_ms, aggregations):
+        """Validate a downsampling policy; every failure is the same error."""
+        if not isinstance(tenant, str) or not tenant:
+            raise ObsError("downsampling policy invalid")
+        if not isinstance(metric, str) or not metric:
+            raise ObsError("downsampling policy invalid")
+        if isinstance(step_ms, bool) or not isinstance(step_ms, int) or step_ms <= 0:
+            raise ObsError("downsampling policy invalid")
+        if not isinstance(aggregations, (list, tuple)) or not aggregations:
+            raise ObsError("downsampling policy invalid")
+        if any(agg not in AGGREGATES for agg in aggregations):
+            raise ObsError("downsampling policy invalid")
+        if len(set(aggregations)) != len(aggregations):
+            raise ObsError("downsampling policy invalid")
+        return [agg for agg in AGGREGATES if agg in aggregations]
+
+    def set_downsampling_policy(self, tenant, metric, step_ms, aggregations):
+        """Create or replace the downsampling policy of ``(tenant, metric)``.
+
+        ``step_ms`` is a positive integer bucket width; ``aggregations`` is a
+        non-empty duplicate-free subset of ``AGGREGATES`` (stored in canonical
+        order). Anything else raises ``ObsError("downsampling policy invalid")``
+        (``400`` semantics) and leaves the persisted config untouched.
+        Replacing an existing policy with a different one keeps the raw
+        samples but clears the policy's old downsampled results; restating the
+        identical policy keeps them.
+        """
+        aggs = self._clean_downsampling_policy(tenant, metric, step_ms, aggregations)
+        key = (tenant, metric)
+        with self._lock:
+            old = self._downsampling.get(key)
+            self._downsampling[key] = {"step_ms": step_ms, "aggregations": aggs}
+            self._save_downsampling()
+            if old is None or old["step_ms"] != step_ms \
+                    or old["aggregations"] != aggs:
+                self._downsampled.pop(key, None)
+                try:
+                    os.remove(self._downsampled_path(tenant, metric))
+                except OSError:
+                    pass
+            return {"tenant": tenant, "metric": metric, "step_ms": step_ms,
+                    "aggregations": list(aggs)}
+
+    def get_downsampling_policy(self, tenant, metric):
+        """The stored policy of ``(tenant, metric)``.
+
+        An unknown pair raises ``ObsError("downsampling policy unavailable")``
+        (``404`` semantics); a malformed key raises
+        ``ObsError("downsampling policy invalid")`` (``400`` semantics).
+        """
+        if not isinstance(tenant, str) or not tenant \
+                or not isinstance(metric, str) or not metric:
+            raise ObsError("downsampling policy invalid")
+        with self._lock:
+            policy = self._downsampling.get((tenant, metric))
+            if policy is None:
+                raise ObsError("downsampling policy unavailable")
+            return {"tenant": tenant, "metric": metric,
+                    "step_ms": policy["step_ms"],
+                    "aggregations": list(policy["aggregations"])}
+
+    def run_downsampling(self, now_ms, tenant=None, metric=None, dry_run=False):
+        """(Re)compute downsampled buckets from the raw samples up to ``now_ms``.
+
+        ``now_ms`` must be a non-boolean integer; only raw samples with
+        ``timestamp_ms <= now_ms`` are processed. ``tenant`` and ``metric``
+        are optional filters (a non-empty string when given); with both
+        omitted every configured policy is processed, in lexicographic
+        ``(tenant, metric)`` order. Any other argument shape raises
+        ``ObsError("downsampling run invalid")`` (``400`` semantics).
+
+        Bucketing and aggregation follow :meth:`query` exactly: a sample at
+        ``t`` lands in the epoch-aligned bucket ``t - (t % step_ms)`` and each
+        declared aggregation is computed over the bucket's samples. Re-running
+        recomputes the affected buckets and upserts them; buckets whose raw
+        samples are gone (e.g. after a retention sweep) are left untouched, so
+        the downsampled history survives the raw points. The report is
+        ``{"dry_run", "policies": [{"tenant", "metric", "step_ms", "buckets",
+        "changed"}, ...]}`` where ``buckets`` counts the buckets recomputed
+        from raw samples and ``changed`` how many of them actually differ from
+        the stored results (new or updated).
+
+        With ``dry_run=True`` the same report is produced but memory, files
+        and the revision are left untouched. A real run is one atomic commit
+        under the store lock and increases the persistent revision exactly
+        once when at least one bucket changed; a run that changes nothing does
+        not move it.
+        """
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise ObsError("downsampling run invalid")
+        if tenant is not None and (not isinstance(tenant, str) or not tenant):
+            raise ObsError("downsampling run invalid")
+        if metric is not None and (not isinstance(metric, str) or not metric):
+            raise ObsError("downsampling run invalid")
+        if not isinstance(dry_run, bool):
+            raise ObsError("downsampling run invalid")
+        with self._lock:
+            keys = sorted(key for key in self._downsampling
+                          if (tenant is None or key[0] == tenant)
+                          and (metric is None or key[1] == metric))
+            reports = []
+            committed = []
+            total_changed = 0
+            for key in keys:
+                policy = self._downsampling[key]
+                step = policy["step_ms"]
+                aggs = policy["aggregations"]
+                stored = self._downsampled.get(key, {})
+                new_state = {sid: {agg: dict(buckets)
+                                   for agg, buckets in per_agg.items()}
+                             for sid, per_agg in stored.items()}
+                buckets = changed = 0
+                for sid in sorted(self._series):
+                    row = self._series[sid]
+                    if row["tenant"] != key[0] or row["metric"] != key[1]:
+                        continue
+                    groups = {}
+                    for stamp, value in self._samples[sid]:
+                        if stamp > now_ms:
+                            break
+                        groups.setdefault(stamp - (stamp % step), []).append(value)
+                    if not groups:
+                        continue
+                    per_series = new_state.setdefault(sid, {})
+                    for bucket in sorted(groups):
+                        values = groups[bucket]
+                        buckets += 1
+                        bucket_changed = False
+                        for agg in aggs:
+                            computed = _aggregate(values, agg)
+                            agg_buckets = per_series.setdefault(agg, {})
+                            if agg_buckets.get(bucket) != computed:
+                                bucket_changed = True
+                                agg_buckets[bucket] = computed
+                        if bucket_changed:
+                            changed += 1
+                reports.append({"tenant": key[0], "metric": key[1],
+                                "step_ms": step, "buckets": buckets,
+                                "changed": changed})
+                if changed:
+                    total_changed += changed
+                    committed.append((key, new_state))
+            if not dry_run:
+                for key, new_state in committed:
+                    self._downsampled[key] = new_state
+                    self._save_downsampled(*key)
+                if total_changed:
+                    self._bump_revision()
+            return {"dry_run": dry_run, "policies": reports}
+
+    def query_downsampled(self, tenant, metric, labels=None, start_ms=None,
+                          end_ms=None, agg=None, matchers=None, read_token=None,
+                          window_ms=None, group_by=None):
+        """Query the precomputed downsampled buckets of a policy.
+
+        The step is fixed to the policy's ``step_ms``; ``agg`` must be one of
+        the policy's declared aggregations. Interval handling, epoch-aligned
+        bucket starts, ``None``-filled empty buckets, series ordering and the
+        exact-label/matcher filtering all follow :meth:`query` (bucketed mode
+        with ``step_ms`` and ``agg``): a matching series with no downsampled
+        bucket in ``[start_ms, end_ms]`` is omitted, and a bucket takes part
+        when its start lies inside the closed interval.
+
+        With no policy for ``(tenant, metric)`` the query fails with
+        ``ObsError("downsampling policy unavailable")`` (``404`` semantics);
+        an ``agg`` the policy does not declare fails with
+        ``ObsError("downsampling aggregation unavailable")`` (``400``);
+        sliding windows, grouping and the counter aggregates are not
+        supported and fail with ``ObsError("downsampled query unsupported")``
+        (``400``). ``read_token`` is validated exactly like :meth:`query`
+        (``invalid read token`` / ``read revision unavailable``). The read
+        runs on one coherent snapshot and never changes any state.
+        """
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
+        compiled_matchers = compile_matchers(matchers)
+        if window_ms is not None or group_by is not None:
+            raise ObsError("downsampled query unsupported")
+        if agg in COUNTER_AGGREGATES:
+            raise ObsError("downsampled query unsupported")
+        with self._lock:
+            policy = self._downsampling.get((tenant, metric))
+            if policy is None:
+                raise ObsError("downsampling policy unavailable")
+            step = policy["step_ms"]
+            if agg is None or agg not in policy["aggregations"]:
+                raise ObsError("downsampling aggregation unavailable")
+            lo = None if start_ms is None else int(start_ms)
+            hi = None if end_ms is None else int(end_ms)
+            if lo is not None and hi is not None and hi < lo:
+                raise ObsError("end_ms must be >= start_ms")
+            matched = self._matching_series(tenant, metric, labels,
+                                            compiled_matchers)
+            stored = self._downsampled.get((tenant, metric), {})
+            snapshot = {sid: dict(per_agg.get(agg, {}))
+                        for sid, per_agg in stored.items()}
+        out = []
+        for sid, series_labels, _samples in matched:
+            buckets = snapshot.get(sid) or {}
+            pairs = sorted((bucket, value) for bucket, value in buckets.items()
+                           if (lo is None or bucket >= lo)
+                           and (hi is None or bucket <= hi))
+            if not pairs:
+                continue
+            values = dict(pairs)
+            out.append({"series_id": sid, "labels": series_labels,
+                        "points": [[bucket, values.get(bucket)]
+                                   for bucket in range(pairs[0][0],
+                                                       pairs[-1][0] + 1, step)]})
+        return out
 
     def stats(self):
         with self._lock:
