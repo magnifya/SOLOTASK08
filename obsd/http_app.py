@@ -78,7 +78,8 @@ def _request_scope(engine, method, path, params, payload):
         if path in ("/v1/query", "/v1/export"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
-                    "/v1/alerts", "/v1/slos", "/v1/slos/status"):
+                    "/v1/alerts", "/v1/slos", "/v1/slos/status",
+                    "/v1/retention/policies"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/quotas", "/v1/stats", "/v1/audit"):
             return "admin", None, None
@@ -96,6 +97,11 @@ def _request_scope(engine, method, path, params, payload):
             return "write", tenants, next(iter(tenants)) if len(tenants) == 1 else None
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/silences",
                     "/v1/slos"):
+            return "write", _tenant_set(payload.get("tenant")), \
+                _scope_tenant(payload.get("tenant"))
+        if path in ("/v1/retention/policies", "/v1/retention/run"):
+            # Tenant-scoped writes; a retention run without a tenant is a
+            # cross-tenant operation only an admin may run.
             return "write", _tenant_set(payload.get("tenant")), \
                 _scope_tenant(payload.get("tenant"))
         if path in ("/v1/quotas", "/v1/inhibitions", "/v1/evaluate"):
@@ -147,6 +153,26 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                                     payload.get("max_points"))
     if (method, path) == ("GET", "/v1/quotas"):
         return 200, store.get_quota(_require(params, "tenant"))
+    if (method, path) == ("POST", "/v1/retention/policies"):
+        # An omitted retention_ms means null (no cleanup); the store validates
+        # tenant and retention_ms and raises ObsError (-> 400) without
+        # touching the config.
+        if set(payload) - {"tenant", "retention_ms"}:
+            raise ObsError("retention policy must contain only tenant and "
+                           "retention_ms")
+        return 200, store.set_retention(_require(payload, "tenant"),
+                                        payload.get("retention_ms"))
+    if (method, path) == ("GET", "/v1/retention/policies"):
+        return 200, store.get_retention(_require(params, "tenant"))
+    if (method, path) == ("POST", "/v1/retention/run"):
+        # ``dry_run`` passes through uncoerced: the store accepts only real
+        # booleans, just like ``now_ms`` accepts only non-bool integers.
+        if set(payload) - {"now_ms", "tenant", "dry_run"}:
+            raise ObsError("retention run must contain only now_ms, tenant "
+                           "and dry_run")
+        return 200, store.run_retention(_require(payload, "now_ms"),
+                                        tenant=payload.get("tenant"),
+                                        dry_run=payload.get("dry_run", False))
     if (method, path) == ("POST", "/v1/series"):
         result = store.write(_require(payload, "tenant"), _require(payload, "metric"),
                              _labels(payload), _require(payload, "samples"),

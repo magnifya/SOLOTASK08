@@ -73,6 +73,26 @@ def _build_parser():
     quota_get = sub.add_parser("quota-get", help="show a tenant's limits and usage")
     quota_get.add_argument("--tenant", required=True)
 
+    retention_set = sub.add_parser("retention-set",
+                                   help="set a tenant's retention policy")
+    retention_set.add_argument("--tenant", required=True)
+    retention_set.add_argument("--retention-ms", type=int, default=None,
+                               help="drop samples older than now_ms minus this "
+                                    "(omit for no cleanup)")
+
+    retention_get = sub.add_parser("retention-get",
+                                   help="show a tenant's retention policy and usage")
+    retention_get.add_argument("--tenant", required=True)
+
+    retention_run = sub.add_parser("retention-run",
+                                   help="apply retention policies at a timestamp")
+    retention_run.add_argument("--now-ms", type=int, required=True)
+    retention_run.add_argument("--tenant", default=None,
+                               help="limit to this tenant (default: all configured "
+                                    "tenants, in lexicographic order)")
+    retention_run.add_argument("--dry-run", action="store_true",
+                               help="compute the result without changing anything")
+
     write = _common(sub.add_parser("write", help="write samples into a series"))
     write.add_argument("--sample", action="append", default=[], metavar="TS:VALUE")
     write.add_argument("--now-ms", type=int, default=None)
@@ -210,6 +230,13 @@ def _run(args, store, engine, access):
         _emit(store.set_quota(args.tenant, args.max_series, args.max_points))
     elif args.command == "quota-get":
         _emit(store.get_quota(args.tenant))
+    elif args.command == "retention-set":
+        _emit(store.set_retention(args.tenant, args.retention_ms))
+    elif args.command == "retention-get":
+        _emit(store.get_retention(args.tenant))
+    elif args.command == "retention-run":
+        _emit(store.run_retention(args.now_ms, tenant=args.tenant,
+                                  dry_run=args.dry_run))
     elif args.command == "write":
         _emit(store.write(args.tenant, args.metric, _labels(args.label),
                           _samples(args.sample), now=args.now_ms, overwrite=args.overwrite))

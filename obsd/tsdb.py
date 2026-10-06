@@ -237,6 +237,7 @@ class SeriesStore:
         <root>/series.json                 registry: series_id -> series row
         <root>/points/<series_id>.jsonl    one ``{"t":ts,"v":value}`` per line
         <root>/quotas.json                 tenant -> {"max_series", "max_points"}
+        <root>/retention.json              tenant -> {"retention_ms"}
     """
 
     def __init__(self, root):
@@ -246,12 +247,15 @@ class SeriesStore:
         self.points_dir = os.path.join(self.root, "points")
         self.series_path = os.path.join(self.root, "series.json")
         self.quota_path = os.path.join(self.root, "quotas.json")
+        self.retention_path = os.path.join(self.root, "retention.json")
         self._lock = threading.RLock()
         self._series, self._samples, self._writes = {}, {}, 0
         self._quotas = {}
+        self._retention = {}
         os.makedirs(self.points_dir, exist_ok=True)
         self._load()
         self._load_quotas()
+        self._load_retention()
 
     def _points_path(self, sid):
         return os.path.join(self.points_dir, sid + ".jsonl")
@@ -1055,6 +1059,128 @@ class SeriesStore:
                                        step_ms=int(window_ms), agg=agg)]
 
     # --------------------------------------------------------------- retention
+    def _load_retention(self):
+        """Reload ``retention.json``; a missing file means no tenant has a policy."""
+        if not os.path.exists(self.retention_path):
+            return
+        try:
+            with open(self.retention_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ObsError("cannot read retention config: %s" % exc)
+        if not isinstance(data, dict):
+            raise ObsError("cannot read retention config: root must be an object")
+        for tenant, row in data.items():
+            if not isinstance(tenant, str) or not tenant or not isinstance(row, dict):
+                raise ObsError("cannot read retention config: malformed entry")
+            self._retention[tenant] = self._clean_limit(row.get("retention_ms"),
+                                                        "retention_ms")
+
+    def _save_retention(self):
+        _atomic_write(self.retention_path, json.dumps(
+            {tenant: {"retention_ms": self._retention[tenant]}
+             for tenant in sorted(self._retention)},
+            sort_keys=True, separators=(",", ":")))
+
+    def set_retention(self, tenant, retention_ms):
+        """Configure the tenant's retention policy; ``None`` means no cleanup.
+
+        ``retention_ms`` is a non-negative integer or ``None``; anything else
+        raises ``ObsError`` and leaves the stored policies untouched.
+        Configuring a policy never creates a series and never deletes a sample
+        by itself — only :meth:`run_retention` applies policies.
+        """
+        tenant = self._clean_tenant(tenant)
+        retention_ms = self._clean_limit(retention_ms, "retention_ms")
+        with self._lock:
+            self._retention[tenant] = retention_ms
+            self._save_retention()
+            return self.get_retention(tenant)
+
+    def get_retention(self, tenant):
+        """The tenant's policy plus current usage; unconfigured means ``None``."""
+        tenant = self._clean_tenant(tenant)
+        with self._lock:
+            series = points = 0
+            for sid, row in self._series.items():
+                if row["tenant"] == tenant:
+                    series += 1
+                    points += len(self._samples[sid])
+            return {"tenant": tenant, "retention_ms": self._retention.get(tenant),
+                    "series": series, "points": points}
+
+    def run_retention(self, now_ms, tenant=None, dry_run=False):
+        """Apply the configured retention policies at ``now_ms`` (or preview it).
+
+        ``now_ms`` is a required non-boolean integer; ``dry_run`` must be a
+        boolean. With ``tenant`` given only that tenant is processed (an
+        unconfigured one has a ``None`` policy); otherwise every configured
+        tenant is processed in lexicographic order. For each tenant the cutoff
+        is ``now_ms - retention_ms`` and every sample with
+        ``timestamp_ms < cutoff_ms`` is dropped — a sample exactly at the
+        cutoff is kept. A ``None`` policy yields a ``None`` cutoff and zero
+        deletions. Affected point files are rewritten (compacted) so one
+        timestamp never occupies more than one physical line, and series that
+        lose their last point stay registered. The freed occupancy counts
+        towards quota checks immediately.
+
+        The result is ``{"dry_run", "tenants"}`` with one
+        ``{"tenant", "cutoff_ms", "dropped", "affected_series",
+        "remaining_points", "compacted_series"}`` entry per processed tenant,
+        in stable (lexicographic) tenant order. The whole run is planned and
+        applied under a single lock acquisition, so concurrent queries and
+        quota or stats reads only ever see the complete state before or after
+        the run. With ``dry_run=True`` the same result is computed but no
+        sample, file, quota, policy or write counter changes.
+        """
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+            raise ObsError("now_ms must be a non-boolean integer timestamp in ms")
+        if not isinstance(dry_run, bool):
+            raise ObsError("dry_run must be a boolean")
+        if tenant is not None:
+            tenant = self._clean_tenant(tenant)
+        with self._lock:
+            names = [tenant] if tenant is not None else sorted(self._retention)
+            plans = []
+            for name in names:
+                retention = self._retention.get(name)
+                cutoff = None if retention is None else now_ms - retention
+                dropped = affected = remaining = 0
+                kept = {}
+                for sid in sorted(self._series):
+                    if self._series[sid]["tenant"] != name:
+                        continue
+                    samples = self._samples[sid]
+                    if cutoff is None:
+                        remaining += len(samples)
+                        continue
+                    keep = [item for item in samples if item[0] >= cutoff]
+                    removed = len(samples) - len(keep)
+                    if removed:
+                        dropped += removed
+                        affected += 1
+                        kept[sid] = keep
+                    remaining += len(keep)
+                plans.append({"tenant": name, "cutoff_ms": cutoff,
+                              "dropped": dropped, "affected_series": affected,
+                              "remaining_points": remaining,
+                              "compacted_series": affected, "kept": kept})
+            if not dry_run:
+                for plan in plans:
+                    for sid, keep in plan["kept"].items():
+                        self._samples[sid] = keep
+                        # Compaction: the rewritten file holds one physical
+                        # line per distinct timestamp, final value only.
+                        self._rewrite_points(sid)
+            return {"dry_run": dry_run,
+                    "tenants": [{"tenant": plan["tenant"],
+                                 "cutoff_ms": plan["cutoff_ms"],
+                                 "dropped": plan["dropped"],
+                                 "affected_series": plan["affected_series"],
+                                 "remaining_points": plan["remaining_points"],
+                                 "compacted_series": plan["compacted_series"]}
+                                for plan in plans]}
+
     def enforce_retention(self, tenant, cutoff_ms):
         """Drop every sample with ``timestamp_ms < cutoff_ms`` for ``tenant``."""
         cutoff = int(cutoff_ms)

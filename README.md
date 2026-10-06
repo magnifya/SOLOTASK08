@@ -36,6 +36,9 @@ stderr and exits non-zero.
 | `serve` | `python3 -m obsd --data-dir ./obsd_data serve --host 127.0.0.1 --port 8080` |
 | `quota-set` | `python3 -m obsd quota-set --tenant acme --max-series 1000 --max-points 1000000` |
 | `quota-get` | `python3 -m obsd quota-get --tenant acme` |
+| `retention-set` | `python3 -m obsd retention-set --tenant acme --retention-ms 86400000` |
+| `retention-get` | `python3 -m obsd retention-get --tenant acme` |
+| `retention-run` | `python3 -m obsd retention-run --now-ms 1700000000000 --tenant acme --dry-run` |
 | `write` | `python3 -m obsd write --tenant acme --metric latency_ms --label host=a --sample 1000:12.5 --now-ms 2000` |
 | `write-batch` | `python3 -m obsd write-batch --entries '[{"tenant":"acme","metric":"latency_ms","samples":[[1000,12.5]]}]' --now-ms 2000` |
 | `query` | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --agg avg` |
@@ -73,6 +76,9 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
+| POST | `/v1/retention/policies` | `{"tenant","retention_ms":n\|null}` | `200 {"tenant","retention_ms","series","points"}`; invalid tenant/retention or extra fields give `400` and leave config untouched |
+| GET | `/v1/retention/policies` | `?tenant=` | `200 {"tenant","retention_ms","series","points"}` (unconfigured tenant reports a `null` policy and real usage) |
+| POST | `/v1/retention/run` | `{"now_ms":n,"tenant"?,"dry_run"?}` | `200 {"dry_run","tenants":[{"tenant","cutoff_ms","dropped","affected_series","remaining_points","compacted_series"},...]}`; `400` on missing/non-integer `now_ms`, non-boolean `dry_run` or extra fields |
 | POST | `/v1/rules` | rule object | `201` stored rule |
 | GET | `/v1/rules` | `?tenant=` | `200 {"rules":[...]}` |
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
@@ -105,11 +111,12 @@ Once the config exists, every non-`/healthz` request must carry
 `401 {"error":"unauthorized"}`. An authenticated principal whose role or
 tenant scope does not cover the request gets `403 {"error":"forbidden"}`.
 `viewer` reads resources inside its tenant scope; `writer` additionally
-writes series, manages rules, silences, routes and SLOs and acknowledges
+writes series, manages rules, silences, routes, SLOs and retention policies,
+runs tenant-scoped retention and acknowledges
 notifications inside its scope; `admin` additionally runs quotas, inhibitions,
 evaluation, stats and the audit endpoint, and is the only role allowed to run
 cross-tenant operations (requests with no single tenant, such as an
-unfiltered `GET /v1/alerts`). Batch writes are checked per entry: if any
+unfiltered `GET /v1/alerts` or a `POST /v1/retention/run` without a tenant). Batch writes are checked per entry: if any
 entry's tenant is outside the caller's scope the whole batch is rejected with
 `403` before anything is written, preserving atomicity. Principals created or
 revoked through the CLI take effect on a running server without a restart.
@@ -146,6 +153,7 @@ Storage layout (all writes atomic via temp file + `os.replace`):
 <data-dir>/series.json              registry: series_id -> tenant/metric/labels
 <data-dir>/points/<series_id>.jsonl one {"t":ts,"v":value} object per line
 <data-dir>/quotas.json              tenant -> {"max_series","max_points"} limits
+<data-dir>/retention.json           tenant -> {"retention_ms"} policies
 <data-dir>/rules.json               <data-dir>/alerts.json
 <data-dir>/slos.json                <data-dir>/silences.json
 <data-dir>/inhibitions.json         <data-dir>/counters.json
@@ -345,6 +353,35 @@ inspected, and parameters are validated even when no series matches.
 that tenant with `timestamp_millis < cutoff_ms` and rewrites the affected point
 files. `stats()` returns `{"series","points","writes","tenants"}`.
 
+**Retention policies and runs.** `set_retention(tenant, retention_ms)` (also
+`POST /v1/retention/policies` and the CLI `retention-set`) persists a
+per-tenant policy in `retention.json`; `retention_ms` is a non-negative integer
+or `null` (an omitted field over HTTP or a bare `retention-set` also means
+`null`, i.e. never clean), anything else is a `400` and leaves the config
+untouched. `get_retention(tenant)` (also `GET /v1/retention/policies?tenant=`
+and `retention-get`) returns `{"tenant","retention_ms","series","points"}` —
+the normalized policy plus the tenant's real usage; an unconfigured tenant
+reports a `null` policy. `run_retention(now_ms, tenant=None, dry_run=False)`
+(also `POST /v1/retention/run` and `retention-run`) applies the policies at the
+required non-boolean integer `now_ms`: for each processed tenant the cutoff is
+`now_ms - retention_ms` and every sample with `timestamp_ms < cutoff_ms` is
+dropped (a sample exactly at the cutoff is kept); a `null` policy yields a
+`null` cutoff and zero deletions. With `tenant` omitted every configured
+tenant is processed in lexicographic order. Affected point files are compacted
+— rewritten so one timestamp never occupies more than one physical line, final
+value only — and series that lose their last point stay registered. The result
+is `{"dry_run","tenants":[...]}` with per-tenant `cutoff_ms`, `dropped`,
+`affected_series`, `remaining_points` and `compacted_series` in stable tenant
+order. A dry run computes the same result but changes no memory, file, quota,
+policy or write counter. The whole run is planned and applied under a single
+lock acquisition, so concurrent queries and quota or stats reads only ever see
+the complete state before or after the run, and the freed point occupancy
+counts towards quota checks immediately. Policies and cleanup results survive
+restarts. With access control enabled, policy writes and tenant-scoped runs
+are `write` operations checked against the caller's tenant scope, policy reads
+are `read` operations, a run without a tenant is a cross-tenant operation only
+an admin may run, and every request is audited like any other endpoint.
+
 **Per-tenant quotas.** `set_quota(tenant, max_series, max_points)` sets the
 tenant-wide limits; each limit is a non-negative integer or `null` (omitted
 fields over HTTP also mean `null`, i.e. unlimited), and `0` forbids adding any.
@@ -514,6 +551,12 @@ sliding-window grids with left-open/right-closed windows, null empty windows
 (including count), full grids for empty series and groups, window argument
 validation across Python/HTTP/CLI, window snapshot consistency under
 concurrent writes and retention, retention,
+retention policies (validation, null policies, persistence across restarts)
+and retention runs (strict cutoff with boundary kept, lexicographic tenant
+order, per-tenant and all-tenant runs, dry runs without side effects, physical
+compaction with final-value dedup, empty series staying registered, immediate
+quota release, concurrent run/query/stats consistency, and the CLI/HTTP
+surfaces with tenant-scoped and admin-only cross-tenant authorization),
 restart safety, rule validation, `for_ms` timing, dedup with occurrence
 counting, resolution and re-firing (including the window that keeps a bad bucket
 blocking), silence scoping and expiry, inhibition by severity and exact label
