@@ -167,6 +167,15 @@ class TestHttpAccessDisabled(HttpAccessCase):
         self.assertEqual(body["series"][0]["points"], [[1, 2.0]])
         code, body = self.request("GET", "/v1/stats")
         self.assertEqual(code, 200)
+        # Type errors are rejected as usual but leave no audit records behind.
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "m", "labels": {}, "samples": [[1, 2.0]],
+            "overwrite": None})
+        self.assertEqual((code, body), (400, {"error": "overwrite must be a boolean"}))
+        code, body = self.request("POST", "/v1/inhibitions", {
+            "source_severity": "critical", "target_severity": "warning",
+            "same_labels": None})
+        self.assertEqual((code, body), (400, {"error": "same_labels must be a boolean"}))
         # No 401/403 and no audit records while access control is off.
         self.assertFalse(os.path.exists(self.access.audit_path))
         code, body = self.request("GET", "/v1/audit")
@@ -286,6 +295,31 @@ class TestHttpAccessEnabled(HttpAccessCase):
         code, body = self.request("GET", "/v1/query?tenant=acme&metric=m&agg=bogus",
                                   token="view-tok")
         self.assertEqual(code, 400)
+    def test_type_errors_are_audited_as_failed_400(self):
+        # The authenticated principal's type errors are recorded as failed/400.
+        code, body = self.admin("POST", "/v1/series", {
+            "tenant": "acme", "metric": "m", "labels": {}, "samples": [[1, 1.0]],
+            "overwrite": None})
+        self.assertEqual((code, body), (400, {"error": "overwrite must be a boolean"}))
+        code, body = self.admin("POST", "/v1/series", {
+            "tenant": "acme", "metric": "m", "labels": {}, "samples": [[1, 1.0]],
+            "now_ms": True})
+        self.assertEqual(code, 400)
+        code, body = self.admin("POST", "/v1/inhibitions", {
+            "source_severity": "critical", "target_severity": "warning",
+            "same_labels": None})
+        self.assertEqual((code, body), (400, {"error": "same_labels must be a boolean"}))
+        entries = self.access.query_audit()
+        self.assertEqual([(row["principal_id"], row["outcome"], row["status"])
+                          for row in entries],
+                         [("root", "failed", 400)] * 3)
+        self.assertEqual([row["tenant"] for row in entries],
+                         ["acme", "acme", None])
+        # The rejections created nothing.
+        code, body = self.admin("GET", "/v1/stats")
+        self.assertEqual((body["store"]["series"], body["store"]["points"],
+                          body["store"]["writes"]), (0, 0, 0))
+        self.assertEqual(self.engine.list_inhibitions(), [])
     def test_audit_log_records_everything(self):
         self.request("GET", "/v1/alerts?tenant=acme")                      # 401
         self.request("GET", "/v1/alerts?tenant=globex", token="view-tok")  # 403

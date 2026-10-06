@@ -193,7 +193,13 @@ class AlertEngine:
         return None
     # ------------------------------------------------------------- inhibition
     def add_inhibition(self, source_severity, target_severity, same_labels=True):
-        """Higher-severity firing alerts suppress matching lower-severity ones."""
+        """Higher-severity firing alerts suppress matching lower-severity ones.
+
+        ``same_labels`` must be a real boolean (omitted defaults to ``True``);
+        ``None``, numbers, strings and other types raise ``ObsError`` before
+        any id is assigned, any counter incremented or ``inhibitions.json``
+        written.
+        """
         for field, value in (("source_severity", source_severity),
                              ("target_severity", target_severity)):
             if value not in SEVERITIES:

@@ -69,7 +69,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
 | GET | `/healthz` | – | `200 {"ok":true}` |
-| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...]}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `409` on conflicting timestamp or quota exceeded |
+| POST | `/v1/series` | `{"tenant","metric","labels","samples":[[ts,value],...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"series_id":"..."}`, `400` on malformed input or a non-boolean `now_ms`/`overwrite` (an explicit `null` `overwrite` is rejected, not treated as `false`), `409` on conflicting timestamp or quota exceeded |
 | POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}`, `400` on malformed entries, `409` on conflict or quota exceeded |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}` |
 | GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}` |
@@ -84,7 +84,7 @@ Errors are always JSON: `{"error":"..."}` with status 400 (bad request),
 | POST | `/v1/evaluate` | `{"now_ms":n}` | `200 {"firing":[...],"silenced":[...],"inhibited":[...],"resolved":[...]}` |
 | GET | `/v1/alerts` | `?tenant=&state=` | `200 {"alerts":[...]}` |
 | POST | `/v1/silences` | `{"tenant","labels","starts_ms","ends_ms","reason"}` | `201` stored silence |
-| POST | `/v1/inhibitions` | `{"source_severity","target_severity","same_labels"}` | `201` stored inhibition |
+| POST | `/v1/inhibitions` | `{"source_severity","target_severity","same_labels"?}` | `201` stored inhibition; `same_labels` must be a real boolean (omitted defaults to `true`; `null`, numbers and strings are rejected with `400` and change nothing) |
 | POST | `/v1/notification-routes` | `{"tenant","target","labels"?,"severities"?,"events"?,"repeat_ms"?,"id"?}` | `201` stored route; `400` invalid, `409` duplicate id |
 | GET | `/v1/notification-routes` | `?tenant=` | `200 {"routes":[...]}` |
 | DELETE | `/v1/notification-routes/{id}` | – | `200 {"deleted":id}`; `404` unknown route (notifications are kept) |
@@ -180,7 +180,11 @@ overwrite=False)` stores `(timestamp_ms, value)` pairs. Writing an existing
 and is counted in `duplicates`. A *different* value for a stored timestamp is a
 conflict: it raises `ObsError` (`409` over HTTP) unless `overwrite=True`, in
 which case the stored value is replaced and counted in `written`. A timestamp
-greater than the injected `now` (when `now` is given) is rejected.
+greater than the injected `now` (when `now` is given) is rejected. `now` is
+`None`/omitted (no future check) or a non-boolean integer; `overwrite` must be
+a boolean (default `False`). Anything else raises `ObsError` (`400` over HTTP)
+before any validation or state change: no series, points, write counter, quota
+usage or temp file is touched.
 
 **Atomic multi-series write.** `write_batch(entries, now=None, overwrite=False)`
 (also `POST /v1/series/batch` and the CLI `write-batch --entries '<json>'`)

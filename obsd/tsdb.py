@@ -384,6 +384,11 @@ class SeriesStore:
         and changes nothing. A differing value for a stored timestamp raises
         ``ObsError`` unless ``overwrite=True``.
 
+        ``now`` is ``None`` (no future check) or a non-boolean integer;
+        ``overwrite`` must be a boolean. Anything else raises ``ObsError``
+        before any validation or state change: no series, points, write
+        counter, quota usage or temp file is touched.
+
         The whole batch is checked against the tenant's configured quotas
         *after* input validation and conflict rules, using the net new series
         and distinct new timestamps the batch would add (same-value replays,
@@ -391,6 +396,10 @@ class SeriesStore:
         batch that would exceed either limit is rejected wholesale with
         ``ObsError``: no series, points or write counter change is kept.
         """
+        if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
+            raise ObsError("now must be a non-boolean integer timestamp in ms or None")
+        if not isinstance(overwrite, bool):
+            raise ObsError("overwrite must be a boolean")
         clean = _clean_samples(samples, now)
         # Labels/tenant are validated before the lock so conflicts and quota
         # breaches never surface as identity errors.

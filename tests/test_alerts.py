@@ -1,5 +1,6 @@
 """Tests for obsd.alerts: rules, firing, silence, inhibition, dedup, SLO math."""
 
+import json
 import os
 import shutil
 import tempfile
@@ -172,6 +173,21 @@ class TestSilenceAndInhibition(EngineCase):
     def test_inhibition_requires_higher_source_severity(self):
         with self.assertRaises(ObsError):
             self.engine.add_inhibition("warning", "critical", True)
+    def test_inhibition_same_labels_must_be_bool(self):
+        self.engine.add_inhibition("critical", "warning", True)
+        self.engine.add_inhibition("critical", "info", False)
+        for bad in (None, 1, 0, "true", []):
+            with self.assertRaises(ObsError, msg=repr(bad)) as caught:
+                self.engine.add_inhibition("critical", "warning", bad)
+            self.assertEqual(str(caught.exception), "same_labels must be a boolean")
+        # No inhibition id was assigned, no counter incremented, no file written.
+        rows = self.engine.list_inhibitions()
+        self.assertEqual([row["id"] for row in rows],
+                         ["inhibition-0001", "inhibition-0002"])
+        self.assertEqual([row["same_labels"] for row in rows], [True, False])
+        with open(os.path.join(self.engine.root, "inhibitions.json"),
+                  encoding="utf-8") as handle:
+            self.assertEqual(len(json.load(handle)), 2)
     def test_alerts_persist_across_restart(self):
         self.engine.add_rule(rule(for_ms=0, window_ms=1000))
         self.values([[1000, 5.0]])

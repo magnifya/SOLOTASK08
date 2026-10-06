@@ -181,10 +181,14 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                                         tenant=payload.get("tenant"),
                                         dry_run=payload.get("dry_run", False))
     if (method, path) == ("POST", "/v1/series"):
+        # ``now_ms`` and ``overwrite`` pass through uncoerced: the store
+        # accepts only None or a non-bool integer for ``now_ms`` and only real
+        # booleans for ``overwrite`` (omitted defaults to False; an explicit
+        # null is rejected, not treated as False).
         result = store.write(_require(payload, "tenant"), _require(payload, "metric"),
                              _labels(payload), _require(payload, "samples"),
                              now=payload.get("now_ms"),
-                             overwrite=bool(payload.get("overwrite", False)))
+                             overwrite=payload.get("overwrite", False))
         return 202, {"written": result["written"], "duplicates": result["duplicates"],
                      "series_id": result["series_id"]}
     if (method, path) == ("POST", "/v1/series/batch"):
@@ -251,9 +255,12 @@ def dispatch(store, engine, method, path, params, payload, access=None):
                                        _require(payload, "starts_ms"),
                                        _require(payload, "ends_ms"), payload.get("reason", ""))
     if (method, path) == ("POST", "/v1/inhibitions"):
+        # ``same_labels`` passes through uncoerced: the engine accepts only
+        # real booleans (omitted defaults to True; an explicit null is
+        # rejected, not treated as True).
         return 201, engine.add_inhibition(_require(payload, "source_severity"),
                                           _require(payload, "target_severity"),
-                                          bool(payload.get("same_labels", True)))
+                                          payload.get("same_labels", True))
     if (method, path) == ("POST", "/v1/slos"):
         return 201, engine.set_slo(_require(payload, "tenant"), _require(payload, "name"),
                                    _require(payload, "metric"), _labels(payload),

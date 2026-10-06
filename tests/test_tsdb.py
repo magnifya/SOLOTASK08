@@ -59,6 +59,32 @@ class TestWrite(StoreCase):
             store.write("", "m", {}, [[1000, 1.0]])
         with self.assertRaises(ObsError):
             store.write("acme", "m", {"k": "v"}, [[1000, 1.0]], now=500)
+    def test_now_must_be_none_or_non_bool_int(self):
+        store = self.store()
+        for bad in (True, False, 1.5, "1000", [1000]):
+            with self.assertRaises(ObsError, msg=repr(bad)) as caught:
+                store.write("acme", "m", {}, [[1000, 1.0]], now=bad)
+            self.assertEqual(str(caught.exception),
+                             "now must be a non-boolean integer timestamp in ms or None")
+        # None (and the omitted default) skips the future check entirely.
+        self.assertEqual(store.write("acme", "m", {}, [[10**15, 1.0]],
+                                     now=None)["written"], 1)
+        self.assertEqual(store.write("acme", "m", {}, [[2000, 2.0]],
+                                     now=2000)["written"], 1)
+        # A failed call left no series, points, writes or quota usage behind.
+        self.assertEqual(store.stats()["writes"], 2)
+        self.assertEqual(store.get_quota("acme"),
+                         {"tenant": "acme", "max_series": None, "max_points": None,
+                          "series": 1, "points": 2})
+        self.assertFalse(os.path.exists(store.series_path + ".tmp"))
+    def test_overwrite_must_be_bool(self):
+        store = self.store()
+        for bad in (1, 0, "true", None, [], 1.0):
+            with self.assertRaises(ObsError, msg=repr(bad)) as caught:
+                store.write("acme", "m", {}, [[1000, 1.0]], overwrite=bad)
+            self.assertEqual(str(caught.exception), "overwrite must be a boolean")
+        self.assertEqual(store.stats()["series"], 0)
+        self.assertEqual(store.stats()["writes"], 0)
 class TestQuery(StoreCase):
     def test_raw_range_query_is_sorted_and_filtered(self):
         store = self.store()

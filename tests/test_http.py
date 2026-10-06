@@ -70,6 +70,62 @@ class TestHttpApi(HttpCase):
         code, body = self.request("GET", "/v1/nope")
         self.assertEqual(code, 404)
         self.assertIn("not found", body["error"])
+    def test_series_now_ms_and_overwrite_are_strict(self):
+        # Omitted defaults are unchanged: no future check, overwrite False.
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {},
+            "samples": [[10**15, 1.0]]})
+        self.assertEqual(code, 202)
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {},
+            "samples": [[1000, 1.0]], "now_ms": 2000})
+        self.assertEqual(code, 202)
+        code, body = self.request("POST", "/v1/series", {
+            "tenant": "acme", "metric": "latency_ms", "labels": {},
+            "samples": [[1000, 9.0]], "overwrite": True})
+        self.assertEqual(code, 202)
+        self.assertEqual(body["written"], 1)
+        # An explicit null overwrite is rejected, not treated as False.
+        for bad in ({"overwrite": None}, {"overwrite": 1}, {"overwrite": "true"},
+                    {"now_ms": True}, {"now_ms": "2000"}, {"now_ms": 1.5}):
+            payload = {"tenant": "acme", "metric": "latency_ms", "labels": {},
+                       "samples": [[3000, 3.0]]}
+            payload.update(bad)
+            code, body = self.request("POST", "/v1/series", payload)
+            self.assertEqual(code, 400, repr(bad))
+            self.assertIn("error", body)
+            if "now_ms" in bad:
+                self.assertEqual(body["error"],
+                                 "now must be a non-boolean integer timestamp in ms or None")
+            else:
+                self.assertEqual(body["error"], "overwrite must be a boolean")
+        # Nothing was created or changed by the rejected requests.
+        code, body = self.request("GET", "/v1/stats")
+        self.assertEqual((body["store"]["series"], body["store"]["points"],
+                          body["store"]["writes"]), (1, 2, 3))
+    def test_inhibitions_same_labels_is_strict(self):
+        code, body = self.request("POST", "/v1/inhibitions", {
+            "source_severity": "critical", "target_severity": "warning"})
+        self.assertEqual(code, 201)
+        self.assertEqual(body["same_labels"], True)
+        code, body = self.request("POST", "/v1/inhibitions", {
+            "source_severity": "critical", "target_severity": "info",
+            "same_labels": False})
+        self.assertEqual(code, 201)
+        self.assertEqual(body["same_labels"], False)
+        # null, numbers and strings are rejected with 400 and change nothing.
+        for bad in (None, 1, 0, "true"):
+            code, body = self.request("POST", "/v1/inhibitions", {
+                "source_severity": "critical", "target_severity": "warning",
+                "same_labels": bad})
+            self.assertEqual(code, 400, repr(bad))
+            self.assertEqual(body["error"], "same_labels must be a boolean")
+        # No inhibition id was assigned, no counter incremented, no file written.
+        self.assertEqual(self.engine.list_inhibitions()[1]["id"], "inhibition-0002")
+        self.assertEqual(len(self.engine.list_inhibitions()), 2)
+        with open(os.path.join(self.engine.root, "inhibitions.json"),
+                  encoding="utf-8") as handle:
+            self.assertEqual(len(json.load(handle)), 2)
     def test_rule_evaluate_alerts_and_silence(self):
         self.write({}, [[60000, 5.0], [65000, 5.0]])
         code, rule = self.request("POST", "/v1/rules", {
