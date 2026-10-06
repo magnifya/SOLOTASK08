@@ -390,7 +390,16 @@ class SeriesStore:
         overwrites and timestamps repeated inside the batch add nothing). A
         batch that would exceed either limit is rejected wholesale with
         ``ObsError``: no series, points or write counter change is kept.
+
+        ``now`` is ``None`` (no future check) or a non-boolean integer;
+        ``overwrite`` must be a real boolean. Both are validated before any
+        sample, identity, conflict or quota processing, exactly as in
+        :meth:`write_batch`.
         """
+        if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
+            raise ObsError("now must be a non-boolean integer timestamp in ms or None")
+        if not isinstance(overwrite, bool):
+            raise ObsError("overwrite must be a boolean")
         clean = _clean_samples(samples, now)
         # Labels/tenant are validated before the lock so conflicts and quota
         # breaches never surface as identity errors.
