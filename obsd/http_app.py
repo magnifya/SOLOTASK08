@@ -53,6 +53,25 @@ def _group_by(value):
         return json.loads(value)
     except ValueError:
         raise ObsError("group_by must be a JSON array of label keys")
+def _label_meta_params(params, extra=()):
+    """Reject any parameter the label-metadata endpoints do not define.
+
+    Allowed: ``tenant``, ``metric``, ``matchers``, ``read_token``, any
+    ``label.k`` filter and the per-endpoint ``extra`` keys; a typo must not
+    pass silently. Every violation is the same unified error.
+    """
+    for key in params:
+        if key.startswith("label.") \
+                or key in ("tenant", "metric", "matchers", "read_token") \
+                or key in extra:
+            continue
+        raise ObsError("label metadata invalid")
+def _label_meta_matchers(params):
+    """Decode the ``matchers`` parameter; any violation is the unified error."""
+    try:
+        return parse_matchers_text(params.get("matchers"))
+    except ObsError:
+        raise ObsError("label metadata invalid") from None
 def _tenant_set(value):
     return {value} if isinstance(value, str) and value else set()
 def _scope_tenant(value):
@@ -81,7 +100,8 @@ def _request_scope(engine, method, path, params, payload):
     """
     if method == "GET":
         if path in ("/v1/query", "/v1/export", "/v1/consistency-token",
-                    "/v1/query/downsampled"):
+                    "/v1/query/downsampled", "/v1/label-names",
+                    "/v1/label-values"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
                     "/v1/alerts", "/v1/slos", "/v1/slos/status"):
@@ -291,6 +311,20 @@ def dispatch(store, engine, method, path, params, payload, access=None):
             start_ms=_int(params.get("start"), "start"),
             end_ms=_int(params.get("end"), "end"),
             matchers=parse_matchers_text(params.get("matchers")),
+            read_token=params.get("read_token"))
+    if (method, path) == ("GET", "/v1/label-names"):
+        # tenant/metric pass through uncoerced: the store rejects anything
+        # missing or not a non-empty string with "label metadata invalid".
+        _label_meta_params(params)
+        return 200, store.label_names(
+            params.get("tenant"), params.get("metric"), labels=labels,
+            matchers=_label_meta_matchers(params),
+            read_token=params.get("read_token"))
+    if (method, path) == ("GET", "/v1/label-values"):
+        _label_meta_params(params, extra=("name",))
+        return 200, store.label_values(
+            params.get("tenant"), params.get("metric"), params.get("name"),
+            labels=labels, matchers=_label_meta_matchers(params),
             read_token=params.get("read_token"))
     if (method, path) == ("POST", "/v1/rules"):
         return 201, engine.add_rule(payload)

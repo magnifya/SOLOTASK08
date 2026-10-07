@@ -47,6 +47,13 @@ def _samples(entries):
     if not out:
         raise ObsError("at least one --sample timestamp_ms:value is required")
     return out
+def _meta_matchers(text):
+    """Decode ``--matchers`` for the label-metadata commands; any violation
+    is the same unified error as every other malformed metadata argument."""
+    try:
+        return parse_matchers_text(text, "--matchers")
+    except ObsError:
+        raise ObsError("label metadata invalid") from None
 def _common(parser, label_help="label matcher key=value"):
     parser.add_argument("--tenant", required=True)
     parser.add_argument("--metric", required=True)
@@ -184,6 +191,25 @@ def _build_parser():
                              'op is one of =, !=, =~, !~ (AND with --label)')
     export.add_argument("--read-token", default=None,
                         help="consistency token the read must catch up to")
+
+    label_names = _common(sub.add_parser(
+        "label-names", help="list the distinct label names of the matching series"))
+    label_names.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                             help='JSON array of {"key","op","value"} matchers; '
+                                  'op is one of =, !=, =~, !~ (AND with --label)')
+    label_names.add_argument("--read-token", default=None,
+                             help="consistency token the read must catch up to")
+
+    label_values = _common(sub.add_parser(
+        "label-values", help="list the distinct values of one label across "
+                             "the matching series"))
+    label_values.add_argument("--name", default=None,
+                              help="label name to list values for (required)")
+    label_values.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                              help='JSON array of {"key","op","value"} matchers; '
+                                   'op is one of =, !=, =~, !~ (AND with --label)')
+    label_values.add_argument("--read-token", default=None,
+                              help="consistency token the read must catch up to")
 
     replay = sub.add_parser("replay", help="replay an exported snapshot into "
                                            "this store")
@@ -350,6 +376,16 @@ def _run(args, store, engine, access):
                                     labels=_labels(args.label),
                                     start_ms=args.start, end_ms=args.end,
                                     matchers=matchers, read_token=args.read_token))
+    elif args.command == "label-names":
+        _emit(store.label_names(args.tenant, args.metric,
+                                labels=_labels(args.label),
+                                matchers=_meta_matchers(args.matchers),
+                                read_token=args.read_token))
+    elif args.command == "label-values":
+        _emit(store.label_values(args.tenant, args.metric, args.name,
+                                 labels=_labels(args.label),
+                                 matchers=_meta_matchers(args.matchers),
+                                 read_token=args.read_token))
     elif args.command == "replay":
         try:
             snapshot = json.loads(args.snapshot)

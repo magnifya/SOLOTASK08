@@ -1293,6 +1293,98 @@ class SeriesStore:
             out.append({"labels": entry["labels"], "points": points})
         return out
 
+    # ---------------------------------------------------------- label metadata
+    @staticmethod
+    def _clean_label_meta(value):
+        """A label-metadata scope field is a non-empty string; anything else
+        is the same rejection as every other malformed metadata argument."""
+        if not isinstance(value, str) or not value:
+            raise ObsError("label metadata invalid")
+        return value
+
+    @staticmethod
+    def _compile_meta_matchers(matchers):
+        """Compile ``matchers``; every violation is the same unified error.
+
+        Runs even when no series could match, so a malformed matcher list is
+        rejected instead of silently yielding an empty result.
+        """
+        try:
+            return compile_matchers(matchers)
+        except ObsError:
+            raise ObsError("label metadata invalid") from None
+
+    def _matching_label_sets(self, tenant, metric, labels, compiled_matchers):
+        """Label dicts of every matching series, copied under one lock.
+
+        The exact ``labels`` filter and the compiled ``matchers`` apply to the
+        raw series labels first, exactly as in :meth:`query`; the snapshot is
+        taken from the registry, so series with no samples take part too.
+        """
+        with self._lock:
+            return [dict(row["labels"]) for row in self._series.values()
+                    if row["tenant"] == tenant and row["metric"] == metric
+                    and matches_labels(dict(row["labels"]), labels)
+                    and matchers_hold(dict(row["labels"]), compiled_matchers)]
+
+    def label_names(self, tenant, metric, labels=None, matchers=None,
+                    read_token=None):
+        """Sorted distinct label names of the matching series of one metric.
+
+        Read-only label discovery for high-cardinality exploration: the source
+        is the registered series of ``(tenant, metric)`` — series with no
+        samples included — filtered by the exact ``labels`` and ``matchers``
+        (both apply to the raw series labels first, as in :meth:`query`). The
+        result is ``{"tenant", "metric", "labels"}`` with the names
+        deduplicated and sorted as Unicode strings; no matching series yields
+        an empty ``labels`` list, not an error.
+
+        ``tenant`` and ``metric`` must be non-empty strings and ``matchers``
+        must follow the :func:`compile_matchers` rules (validated even with no
+        candidate series); any violation raises
+        ``ObsError("label metadata invalid")`` (``400`` semantics).
+        ``read_token`` is validated exactly as in :meth:`query`. The whole
+        lookup reads one coherent snapshot under a single lock acquisition and
+        never changes series, samples, counters or the revision.
+        """
+        tenant = self._clean_label_meta(tenant)
+        metric = self._clean_label_meta(metric)
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
+        compiled = self._compile_meta_matchers(matchers)
+        names = set()
+        for series_labels in self._matching_label_sets(
+                tenant, metric, labels, compiled):
+            names.update(series_labels)
+        return {"tenant": tenant, "metric": metric, "labels": sorted(names)}
+
+    def label_values(self, tenant, metric, name, labels=None, matchers=None,
+                     read_token=None):
+        """Sorted distinct values of one label across the matching series.
+
+        Same scope, filters, token and snapshot semantics as
+        :meth:`label_names`; ``name`` must additionally be a non-empty string.
+        A matching series that does not carry the label contributes nothing,
+        while a present-but-empty value is kept as ``""``. The result is
+        ``{"tenant", "metric", "label", "values"}`` with the values
+        deduplicated and sorted as Unicode strings; no matching series or no
+        series carrying the label yields an empty ``values`` list, not an
+        error. The lookup is read-only and never moves the revision.
+        """
+        tenant = self._clean_label_meta(tenant)
+        metric = self._clean_label_meta(metric)
+        name = self._clean_label_meta(name)
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
+        compiled = self._compile_meta_matchers(matchers)
+        values = set()
+        for series_labels in self._matching_label_sets(
+                tenant, metric, labels, compiled):
+            if name in series_labels:
+                values.add(series_labels[name])
+        return {"tenant": tenant, "metric": metric, "label": name,
+                "values": sorted(values)}
+
     def rollup(self, tenant, metric, labels, window_ms, agg):
         """Downsampled series over the whole stored range, ordered by series_id."""
         if agg not in AGGREGATES:

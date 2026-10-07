@@ -51,6 +51,8 @@ stderr and exits non-zero.
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
 | `export` | `python3 -m obsd export --tenant acme --metric latency_ms --start 0 --end 5000 [--read-token T]` |
+| `label-names` | `python3 -m obsd label-names --tenant acme --metric latency_ms [--label host=a] [--matchers JSON] [--read-token T]` |
+| `label-values` | `python3 -m obsd label-values --tenant acme --metric latency_ms --name host [--read-token T]` |
 | `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000 [--return-revision]` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
@@ -80,6 +82,8 @@ conflict, quota exceeded or `read revision unavailable`).
 | POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}` (plus `"revision"` when `return_revision` is true), `400` on malformed entries, `409` on conflict or quota exceeded |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=&read_token=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}`, `400` on an invalid read token, `409` while the token's revision is unavailable |
 | GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=&read_token=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}`, `400`/`409` on read-token failures |
+| GET | `/v1/label-names` | `?tenant=&metric=&label.k=v&matchers=&read_token=` (no other parameters) | `200 {"tenant","metric","labels":[...]}` — distinct label names of the matching registered series (empty series included), deduplicated and sorted; `400 {"error":"label metadata invalid"}` on missing/invalid fields, unknown parameters or bad matchers, `400`/`409` on read-token failures |
+| GET | `/v1/label-values` | `?tenant=&metric=&name=&label.k=v&matchers=&read_token=` (no other parameters) | `200 {"tenant","metric","label","values":[...]}` — distinct values of `name` across the matching series (series without the label contribute nothing, empty values stay `""`); same errors as `/v1/label-names` |
 | POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run; plus `"revision"` when `return_revision` is true), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
@@ -293,6 +297,25 @@ yield an empty result. Invalid JSON, a non-array, non-object elements, missing
 or extra fields, wrong types, an empty `key`, an unsupported `op` or an invalid
 regex raise `ObsError` (`400` over HTTP, one JSON error line on stderr for the
 CLI); every matcher is validated even when no candidate series exists.
+
+**Label metadata.** `label_names(tenant, metric, labels=None, matchers=None,
+read_token=None)` and `label_values(tenant, metric, name, ...)` (also
+`GET /v1/label-names`, `GET /v1/label-values` and the CLI `label-names` /
+`label-values`) answer high-cardinality label discovery without touching
+samples: the source is the registered series of the given `tenant`/`metric`
+(series with no samples included), filtered by the exact `label.k=v` filters
+and `matchers` first, exactly as in `query`. Names and values are deduplicated
+and sorted as Unicode strings; a series missing the requested label
+contributes no value, while a present-but-empty value stays `""`. No matching
+series (or no series carrying the label) yields `200` with an empty array —
+never a 404. A missing or wrongly typed `tenant`/`metric`/`name`, malformed
+`matchers` (validated even with no candidate series) or an unknown parameter
+all fail with `400 {"error":"label metadata invalid"}`; `read_token` follows
+the same signing, tenant binding and revision catch-up rules as `query`
+(`400 {"error":"invalid read token"}`, `409 {"error":"read revision
+unavailable"}`). Both lookups read one coherent snapshot under a single lock,
+never change series, samples, counters or the revision, and are tenant-scoped
+`read` operations when access control is enabled (anonymous otherwise).
 
 **Grouped query.** `query(..., agg=agg, group_by=[keys...])` aggregates *across*
 series: matching series (same tenant/metric/label filters and `[start_ms,
