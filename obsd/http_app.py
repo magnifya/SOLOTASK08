@@ -81,7 +81,8 @@ def _request_scope(engine, method, path, params, payload):
     """
     if method == "GET":
         if path in ("/v1/query", "/v1/export", "/v1/consistency-token",
-                    "/v1/query/downsampled"):
+                    "/v1/query/downsampled", "/v1/label-names",
+                    "/v1/label-values"):
             return "read", _tenant_set(params.get("tenant")), params.get("tenant")
         if path in ("/v1/rules", "/v1/notification-routes", "/v1/notifications",
                     "/v1/alerts", "/v1/slos", "/v1/slos/status"):
@@ -292,6 +293,38 @@ def dispatch(store, engine, method, path, params, payload, access=None):
             end_ms=_int(params.get("end"), "end"),
             matchers=parse_matchers_text(params.get("matchers")),
             read_token=params.get("read_token"))
+    if method == "GET" and path in ("/v1/label-names", "/v1/label-values"):
+        # Read-only label metadata discovery. Only the same parameters as a
+        # filtered read are allowed; anything else (a typo must not pass
+        # silently) is "label metadata invalid" (-> 400), as are missing or
+        # mistyped tenant/metric/name and malformed matchers.
+        allowed = {"tenant", "metric", "matchers", "read_token"}
+        if path == "/v1/label-values":
+            allowed.add("name")
+        for key in params:
+            if key in allowed or key.startswith("label."):
+                continue
+            raise ObsError("label metadata invalid")
+        try:
+            compiled = parse_matchers_text(params.get("matchers"))
+            if path == "/v1/label-names":
+                body = store.label_names(
+                    _require(params, "tenant"), _require(params, "metric"),
+                    labels=labels, matchers=compiled,
+                    read_token=params.get("read_token"))
+            else:
+                body = store.label_values(
+                    _require(params, "tenant"), _require(params, "metric"),
+                    _require(params, "name"), labels=labels, matchers=compiled,
+                    read_token=params.get("read_token"))
+        except ObsError as exc:
+            message = str(exc)
+            # Read-token failures keep their exact wording/status; every other
+            # rejection (tenant, metric, name, matchers, ...) is one error.
+            if message not in ("invalid read token", "read revision unavailable"):
+                raise ObsError("label metadata invalid")
+            raise
+        return 200, body
     if (method, path) == ("POST", "/v1/rules"):
         return 201, engine.add_rule(payload)
     if (method, path) == ("GET", "/v1/rules"):

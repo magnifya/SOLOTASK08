@@ -51,6 +51,8 @@ stderr and exits non-zero.
 | `query` (matchers) | `python3 -m obsd query --tenant acme --metric latency_ms --matchers '[{"key":"host","op":"=~","value":"api-.*"}]'` |
 | `query` (sliding window) | `python3 -m obsd query --tenant acme --metric latency_ms --start 0 --end 5000 --step 1000 --window-ms 5000 --agg avg` |
 | `export` | `python3 -m obsd export --tenant acme --metric latency_ms --start 0 --end 5000 [--read-token T]` |
+| `label-names` | `python3 -m obsd label-names --tenant acme --metric latency_ms [--read-token T]` |
+| `label-values` | `python3 -m obsd label-values --tenant acme --metric latency_ms --name host [--read-token T]` |
 | `replay` | `python3 -m obsd replay --snapshot '{"version":1,"snapshot_id":"...","entries":[...]}' --now-ms 5000 [--return-revision]` |
 | `rule-add` | `python3 -m obsd rule-add --tenant acme --metric latency_ms --comparator "<" --threshold 10 --window-ms 60000 --for-ms 30000 --agg avg --severity warning` |
 | `eval` | `python3 -m obsd eval --now-ms 68000` |
@@ -80,6 +82,8 @@ conflict, quota exceeded or `read revision unavailable`).
 | POST | `/v1/series/batch` | `{"entries":[{"tenant","metric","samples","labels"?},...],"now_ms"?,"overwrite"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[{"series_id","written","duplicates"},...]}` (plus `"revision"` when `return_revision` is true), `400` on malformed entries, `409` on conflict or quota exceeded |
 | GET | `/v1/query` | `?tenant=&metric=&label.k=v&start=&end=&step=&agg=&group_by=&window=&matchers=&read_token=` (group_by and matchers are JSON arrays; matchers holds `{"key","op","value"}` objects) | `200 {"series":[{"labels":{...},"points":[[ts,value\|null],...]}]}`, `400` on an invalid read token, `409` while the token's revision is unavailable |
 | GET | `/v1/export` | `?tenant=&metric=&label.k=v&start=&end=&matchers=&read_token=` (same filters and closed-interval semantics as `/v1/query`) | `200 {"version":1,"snapshot_id":"...","entries":[{"tenant","metric","labels","samples"},...]}`, `400`/`409` on read-token failures |
+| GET | `/v1/label-names` | `?tenant=&metric=&label.k=v&matchers=&read_token=` | `200 {"tenant","metric","labels":[...]}` — distinct label names of the matching registered series, sorted; an empty result is `200` with `"labels":[]`, not `404` |
+| GET | `/v1/label-values` | `?tenant=&metric=&name=&label.k=v&matchers=&read_token=` | `200 {"tenant","metric","label","values":[...]}` — distinct values of `name` across the matching series, sorted with `""` kept; missing/type-wrong `tenant`/`metric`/`name`/`matchers` or an unknown parameter give `400 {"error":"label metadata invalid"}`; read-token failures are `400`/`409` |
 | POST | `/v1/replay` | `{"version":1,"snapshot_id":"...","entries":[...],"now_ms"?,"overwrite"?,"dry_run"?,"return_revision"?}` | `202 {"written":n,"duplicates":m,"results":[...],"applied":true}` (`200` with `"applied":false` for a dry run; plus `"revision"` when `return_revision` is true), `400` on invalid input or digest mismatch, `409` on conflict or quota exceeded |
 | POST | `/v1/quotas` | `{"tenant","max_series":n\|null,"max_points":n\|null}` | `200 {"tenant","max_series","max_points","series","points"}`; invalid tenant/limits give `400` and leave config untouched |
 | GET | `/v1/quotas` | `?tenant=` | `200 {"tenant","max_series","max_points","series","points"}` (unconfigured tenant reports `null` limits and real usage) |
@@ -293,6 +297,42 @@ yield an empty result. Invalid JSON, a non-array, non-object elements, missing
 or extra fields, wrong types, an empty `key`, an unsupported `op` or an invalid
 regex raise `ObsError` (`400` over HTTP, one JSON error line on stderr for the
 CLI); every matcher is validated even when no candidate series exists.
+
+**Label metadata discovery.** `label_names(tenant, metric, labels=None,
+matchers=None, read_token=None)` and `label_values(tenant, metric, name,
+labels=None, matchers=None, read_token=None)` (also
+`GET /v1/label-names`, `GET /v1/label-values` and the CLI `label-names` /
+`label-values`) read label metadata straight from the series registry for
+high-cardinality discovery: samples are never read. The source is exactly the
+series already registered for `(tenant, metric)` — an empty series
+(registered with no samples, or emptied by retention) participates, and
+series of other tenants or metrics never do. Both reads run on one coherent
+snapshot under a single lock acquisition and never change state, stats,
+quotas or the revision.
+
+Exact `label.k=v` filters and `matchers` behave exactly as in `query`
+(validated up front, even with no candidate series) and filter the raw series
+labels before names or values are collected. `label-names` returns the union
+of the surviving series' label keys as
+`{"tenant","metric","labels":[...]}`; `label-values` additionally requires a
+non-empty `name` and returns
+`{"tenant","metric","label","values":[...]}` with the distinct values of that
+label — a series missing `name` contributes nothing, while a present label
+with an empty value keeps `""`. Names and values are deduplicated and sorted
+by Unicode code point. No matching series, or a label with no value, is a
+successful read with an empty array, never `404`.
+
+Missing or mistyped `tenant`, `metric`, `name` or `matchers`, and any unknown
+request parameter, all fail with the single error `label metadata invalid`
+(`400` over HTTP, one JSON error line on stderr for the CLI); matchers are
+still validated first when there are no candidate series. `read_token` reuses
+the ordinary read-consistency rules unchanged: a forged, malformed or
+cross-tenant token is `invalid read token` (`400`) and an unreached revision
+is `read revision unavailable` (`409`). With access control enabled both
+entries are tenant-scoped `read` operations (viewer and above within scope,
+audited like every other endpoint); while no `access.json` exists they stay
+anonymous. Entries that do not use the new parameters keep their previous
+responses and error semantics exactly.
 
 **Grouped query.** `query(..., agg=agg, group_by=[keys...])` aggregates *across*
 series: matching series (same tenant/metric/label filters and `[start_ms,
@@ -606,8 +646,10 @@ JSON) carries an extra `revision`: the commit revision when the call
 committed, otherwise the current revision. When omitted, results keep their
 previous shape exactly.
 
-`query`, `export_snapshot` and `slo_status` accept an optional `read_token`
-(`read_token` on `GET /v1/query`, `/v1/export` and `/v1/slos/status`,
+`query`, `export_snapshot`, `label_names`, `label_values` and `slo_status`
+accept an optional `read_token`
+(`read_token` on `GET /v1/query`, `/v1/export`, `/v1/label-names`,
+`/v1/label-values` and `/v1/slos/status`,
 `--read-token` on the CLI). A read carrying a token is gated on the token's
 revision: it is processed only once this instance has caught up to it, and
 then runs on one coherent snapshot. Re-reading with the same token may see
@@ -689,6 +731,13 @@ recomputation, dry runs, single revision bumps, tenant/metric filtering,
 restart and retention survival, downsampled queries with null-filled buckets,
 matcher/label filtering, the unavailable/unsupported error shapes, and the
 HTTP/CLI surfaces with role scoping and audit),
+read-only label metadata discovery (names and values from the registered
+series with empty series included and missing labels contributing no value,
+dedup/Unicode ordering and `""` values, exact and matcher filters applied to
+series labels in one snapshot, empty arrays instead of 404, the unified
+`label metadata invalid` validation including matchers checked with no
+candidate series, read-only revision/stats behaviour, read-token rejection
+and `409`, and the HTTP/CLI surfaces with tenant-scoped access and audit),
 and the live HTTP surface over a real socket.
 
 Everything is deterministic: the suite injects every timestamp it uses, and the

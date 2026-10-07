@@ -185,6 +185,34 @@ def _build_parser():
     export.add_argument("--read-token", default=None,
                         help="consistency token the read must catch up to")
 
+    label_names = sub.add_parser("label-names",
+                                 help="list distinct label names of the "
+                                      "registered series of one tenant/metric")
+    label_names.add_argument("--tenant", default=None)
+    label_names.add_argument("--metric", default=None)
+    label_names.add_argument("--label", action="append", default=[],
+                             help="label matcher key=value")
+    label_names.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                             help='JSON array of {"key","op","value"} matchers; '
+                                  'op is one of =, !=, =~, !~ (AND with --label)')
+    label_names.add_argument("--read-token", default=None,
+                             help="consistency token the read must catch up to")
+
+    label_values = sub.add_parser("label-values",
+                                  help="list distinct values of one label of "
+                                       "the registered series of one tenant/metric")
+    label_values.add_argument("--tenant", default=None)
+    label_values.add_argument("--metric", default=None)
+    label_values.add_argument("--name", default=None,
+                              help="label name; must be non-empty")
+    label_values.add_argument("--label", action="append", default=[],
+                              help="label matcher key=value")
+    label_values.add_argument("--matchers", default=None, metavar="JSON_ARRAY",
+                              help='JSON array of {"key","op","value"} matchers; '
+                                   'op is one of =, !=, =~, !~ (AND with --label)')
+    label_values.add_argument("--read-token", default=None,
+                              help="consistency token the read must catch up to")
+
     replay = sub.add_parser("replay", help="replay an exported snapshot into "
                                            "this store")
     replay.add_argument("--snapshot", required=True, metavar="JSON",
@@ -350,6 +378,28 @@ def _run(args, store, engine, access):
                                     labels=_labels(args.label),
                                     start_ms=args.start, end_ms=args.end,
                                     matchers=matchers, read_token=args.read_token))
+    elif args.command in ("label-names", "label-values"):
+        # Missing/empty tenant, metric and name, and malformed matchers all
+        # surface as the same one-line "label metadata invalid" error as the
+        # HTTP 400; read-token failures keep their own wording.
+        try:
+            matchers = parse_matchers_text(args.matchers, "--matchers")
+            if args.command == "label-names":
+                body = store.label_names(args.tenant, args.metric,
+                                         labels=_labels(args.label),
+                                         matchers=matchers,
+                                         read_token=args.read_token)
+            else:
+                body = store.label_values(args.tenant, args.metric, args.name,
+                                          labels=_labels(args.label),
+                                          matchers=matchers,
+                                          read_token=args.read_token)
+        except ObsError as exc:
+            message = str(exc)
+            if message not in ("invalid read token", "read revision unavailable"):
+                raise ObsError("label metadata invalid")
+            raise
+        _emit(body)
     elif args.command == "replay":
         try:
             snapshot = json.loads(args.snapshot)

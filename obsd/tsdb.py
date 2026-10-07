@@ -887,6 +887,85 @@ class SeriesStore:
             {"version": 1, "entries": entries})).hexdigest()
         return {"version": 1, "snapshot_id": digest, "entries": entries}
 
+    # -------------------------------------------------------- label metadata
+    # Read-only label name/value discovery over the series already registered
+    # for one (tenant, metric). Both reads take one coherent snapshot under a
+    # single lock acquisition and never touch samples, counters, quotas, the
+    # revision or any file.
+    @staticmethod
+    def _clean_metadata_tenant(tenant):
+        if not isinstance(tenant, str) or not tenant:
+            raise ObsError("label metadata invalid")
+        return tenant
+
+    @staticmethod
+    def _clean_metadata_metric(metric):
+        if not isinstance(metric, str) or not metric:
+            raise ObsError("label metadata invalid")
+        return metric
+
+    def label_names(self, tenant, metric, labels=None, matchers=None,
+                    read_token=None):
+        """Distinct label names of the matching registered series.
+
+        Every registered series of ``(tenant, metric)`` that survives the
+        exact ``labels`` and compiled ``matchers`` filters contributes its
+        label keys — series with no samples and series with no labels at all
+        participate the same way (the latter simply contributes nothing).
+        The read token gates the lookup exactly as in :meth:`query`; the
+        matchers are compiled (and therefore validated) before the registry is
+        scanned, so an invalid matcher fails even when no candidate series
+        exists. Names are deduplicated and sorted by Unicode code point.
+        Returns ``{"tenant", "metric", "labels": [...]}``.
+        """
+        tenant = self._clean_metadata_tenant(tenant)
+        metric = self._clean_metadata_metric(metric)
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
+        compiled_matchers = compile_matchers(matchers)
+        names = set()
+        with self._lock:
+            for row in self._series.values():
+                if row["tenant"] != tenant or row["metric"] != metric:
+                    continue
+                series_labels = dict(row["labels"])
+                if not matches_labels(series_labels, labels) \
+                        or not matchers_hold(series_labels, compiled_matchers):
+                    continue
+                names.update(series_labels)
+        return {"tenant": tenant, "metric": metric,
+                "labels": sorted(names)}
+
+    def label_values(self, tenant, metric, name, labels=None, matchers=None,
+                     read_token=None):
+        """Distinct values of label ``name`` across the matching series.
+
+        Filters exactly like :meth:`label_names`; series missing ``name``
+        contribute nothing, while a present label with an empty value keeps
+        ``""``. Values are deduplicated and sorted by Unicode code point.
+        Returns ``{"tenant", "metric", "label", "values": [...]}``.
+        """
+        tenant = self._clean_metadata_tenant(tenant)
+        metric = self._clean_metadata_metric(metric)
+        if not isinstance(name, str) or not name:
+            raise ObsError("label metadata invalid")
+        if read_token is not None:
+            self.check_read_token(read_token, tenant)
+        compiled_matchers = compile_matchers(matchers)
+        values = set()
+        with self._lock:
+            for row in self._series.values():
+                if row["tenant"] != tenant or row["metric"] != metric:
+                    continue
+                series_labels = dict(row["labels"])
+                if name not in series_labels \
+                        or not matches_labels(series_labels, labels) \
+                        or not matchers_hold(series_labels, compiled_matchers):
+                    continue
+                values.add(series_labels[name])
+        return {"tenant": tenant, "metric": metric, "label": name,
+                "values": sorted(values)}
+
     # ------------------------------------------------------------------ replay
     def replay_snapshot(self, snapshot, now_ms=None, overwrite=False,
                         dry_run=False, return_revision=False):
